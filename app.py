@@ -718,10 +718,28 @@ def inject_css():
           radial-gradient(circle at 20% 90%, rgba(129, 199, 132, 0.28), transparent 45%),
           radial-gradient(circle at 90% 85%, rgba(79, 195, 247, 0.25), transparent 45%),
           #fbfbff;
+        overflow-x: hidden; /* 横はみ出しで切れるのも防止 */
     }
     html, body, [class*="css"] { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
-    .block-container { max-width: 980px; padding-top: 1rem; padding-bottom: 2rem; }
-    @media (max-width: 640px) { .block-container { padding-left: 0.7rem; padding-right: 0.7rem; } }
+    body { overflow-x: hidden; }
+
+    /* ✅ここが重要：上部バーに隠れないように上の余白を増やす */
+    .block-container {
+        max-width: 980px;
+        padding-top: calc(env(safe-area-inset-top) + 4.6rem);
+        padding-bottom: 2rem;
+        padding-left: 1rem;
+        padding-right: 1rem;
+    }
+
+    /* スマホは上のバーが大きいことがあるので、さらに余白を増やす */
+    @media (max-width: 640px) {
+        .block-container {
+            padding-top: calc(env(safe-area-inset-top) + 5.6rem);
+            padding-left: 0.7rem;
+            padding-right: 0.7rem;
+        }
+    }
 
     .wf-title {
         font-size: 1.7rem; font-weight: 900; letter-spacing: .2px;
@@ -750,7 +768,6 @@ def inject_css():
         box-shadow: 0 6px 16px rgba(0,0,0,0.05) !important;
     }
 
-    /* FullCalendar big */
     .fc { font-size: 1.05rem; }
     .fc .fc-toolbar-title { font-size: 1.25rem; font-weight: 900; }
     .fc .fc-daygrid-day-number { font-weight: 900; }
@@ -762,6 +779,7 @@ def inject_css():
     </style>
     """
     st.markdown(css, unsafe_allow_html=True)
+
 
 
 def risk_card(label: str, color: str, emoji: str, total_score: int, base_score: int, daily_score: int):
