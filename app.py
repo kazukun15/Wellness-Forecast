@@ -654,11 +654,17 @@ def call_gemini_for_advice(
 
 
 # ==================================================
-# UI: CSS
+# UI: CSS（文字色を濃い灰色に固定）
 # ==================================================
 def inject_css():
     css = """
     <style>
+    :root{
+      --wf-text: #2f2f2f;     /* ✅ 文字色（濃い灰色） */
+      --wf-text-sub: #4a4a4a; /* ✅ 補助テキスト */
+      --wf-link: #1e5eff;
+    }
+
     .stApp {
         background:
           radial-gradient(circle at 15% 10%, rgba(255, 214, 102, 0.35), transparent 40%),
@@ -667,9 +673,26 @@ def inject_css():
           radial-gradient(circle at 90% 85%, rgba(79, 195, 247, 0.25), transparent 45%),
           #fbfbff;
         overflow-x: hidden;
+        color: var(--wf-text);
     }
+
+    /* ✅ Streamlit全体に強制で文字色を適用 */
+    html, body, [class*="css"], .stMarkdown, .stMarkdown p, .stMarkdown li, .stMarkdown span,
+    div, p, li, label, textarea, input, button {
+        color: var(--wf-text) !important;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    }
+
+    /* リンク */
+    a, a:visited { color: var(--wf-link) !important; }
+
+    /* Streamlitの説明文っぽい薄文字を少し濃く */
+    small, .stCaption, [data-testid="stCaptionContainer"] * {
+        color: var(--wf-text-sub) !important;
+        opacity: 1 !important;
+    }
+
     body { overflow-x: hidden; }
-    html, body, [class*="css"] { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
 
     .block-container {
         max-width: 980px;
@@ -692,15 +715,16 @@ def inject_css():
         -webkit-background-clip: text; -webkit-text-fill-color: transparent;
         display: flex; gap: .4rem; align-items: center; margin-bottom: .15rem;
     }
-    .wf-sub { font-size: .95rem; opacity: .86; margin-bottom: .55rem; }
+    .wf-sub { font-size: .95rem; color: var(--wf-text-sub) !important; opacity: 1 !important; margin-bottom: .55rem; }
 
     .wf-card {
-        background: rgba(255,255,255,0.86);
-        border: 1px solid rgba(0,0,0,0.06);
+        background: rgba(255,255,255,0.90);
+        border: 1px solid rgba(0,0,0,0.08);
         border-radius: 18px;
         padding: 12px 14px;
         box-shadow: 0 6px 18px rgba(0,0,0,0.05);
         margin-top: .6rem;
+        color: var(--wf-text) !important;
     }
     .wf-section {
         font-size: 1.05rem;
@@ -710,23 +734,30 @@ def inject_css():
         display:flex;
         align-items:center;
         gap:.35rem;
+        color: var(--wf-text) !important;
     }
     .wf-badge {
         display:inline-block;
         padding: .18rem .55rem;
         border-radius: 999px;
         font-weight: 900;
-        border: 1px solid rgba(0,0,0,0.08);
-        background: rgba(255,255,255,0.65);
+        border: 1px solid rgba(0,0,0,0.12);
+        background: rgba(255,255,255,0.75);
         margin-right: .35rem;
+        color: var(--wf-text) !important;
     }
 
     .stButton>button {
         border-radius: 14px !important;
         padding: 0.58rem 0.82rem !important;
         font-weight: 800 !important;
-        border: 1px solid rgba(0,0,0,0.08) !important;
+        border: 1px solid rgba(0,0,0,0.10) !important;
         box-shadow: 0 6px 16px rgba(0,0,0,0.05) !important;
+    }
+
+    /* ✅ metricの文字も濃く */
+    [data-testid="stMetricLabel"], [data-testid="stMetricValue"] {
+        color: var(--wf-text) !important;
     }
     </style>
     """
@@ -737,12 +768,12 @@ def risk_card(label: str, color: str, emoji: str, total_score: int, base_score: 
     bg = f"{color}22"
     st.markdown(
         f"""
-        <div class="wf-card" style="border-color:{color}44;background:{bg};">
-          <div style="font-size:1.1rem;font-weight:900;display:flex;gap:.45rem;align-items:center;">
+        <div class="wf-card" style="border-color:{color}66;background:{bg};">
+          <div style="font-size:1.1rem;font-weight:900;display:flex;gap:.45rem;align-items:center;color:#2f2f2f;">
             <span style="font-size:1.25rem;">{emoji}</span>
             <span>きょうの体調リスク：{label}</span>
           </div>
-          <div style="opacity:.92;margin-top:.25rem;">
+          <div style="opacity:1;margin-top:.25rem;color:#2f2f2f;">
             スコア合計 <b>{total_score}</b>（ベース {base_score} ＋ 今日 {daily_score}）
           </div>
         </div>
@@ -760,10 +791,9 @@ def forecast_label_style(label: str) -> Tuple[str, str]:
 
 
 def render_forecast_cards(forecast_days: List[Dict[str, Any]]):
-    st.markdown('<div class="wf-section">🗓️ 予報（カレンダー停止：カード一覧）</div>', unsafe_allow_html=True)
-    st.markdown("<div class='wf-card'>日付ごとの「崩れやすさ」をカードで表示します。タップで理由が見られます。</div>", unsafe_allow_html=True)
+    st.markdown('<div class="wf-section">🗓️ 予報（カード一覧）</div>', unsafe_allow_html=True)
+    st.markdown("<div class='wf-card'>日付ごとの「崩れやすさ」をカードで表示します。開くと理由が見られます。</div>", unsafe_allow_html=True)
 
-    # 3列グリッド（スマホは自動で縦に落ちる）
     cols = st.columns(3)
     for i, d in enumerate(forecast_days):
         date_obj: dt.date = d["date"]
@@ -773,7 +803,7 @@ def render_forecast_cards(forecast_days: List[Dict[str, Any]]):
         with col:
             with st.expander(f"{date_str}  {title}  （スコア {d['score']}）", expanded=False):
                 st.markdown(
-                    f"<div class='wf-card' style='background:{bg};border-color:rgba(0,0,0,0.06)'>"
+                    f"<div class='wf-card' style='background:{bg};border-color:rgba(0,0,0,0.10)'>"
                     f"<span class='wf-badge'>最低気圧</span>{fmt_opt(d.get('min_pressure'), '.1f')} hPa<br>"
                     f"<span class='wf-badge'>気圧変化(3h)</span>{fmt_opt(d.get('max_drop_3h'), '+.1f')} hPa<br>"
                     f"<span class='wf-badge'>気温</span>{fmt_opt(d.get('min_temp'), '.1f')}〜{fmt_opt(d.get('max_temp'), '.1f')} ℃<br>"
@@ -1047,7 +1077,6 @@ def main():
         else:
             st.markdown(f"<div class='wf-card'>{safe_html_text(res.get('gemini_text'))}</div>", unsafe_allow_html=True)
 
-        # ✅ カレンダーは完全に停止：カード一覧で予報表示
         if res.get("forecast_days"):
             render_forecast_cards(res["forecast_days"])
         else:
