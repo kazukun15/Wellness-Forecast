@@ -3,17 +3,27 @@ import json
 import datetime as dt
 from datetime import datetime
 from typing import Dict, Any, List, Optional
+import calendar as pycal
 
 import requests
 import streamlit as st
 
+# Gemini（任意）
 from google import genai
 from google.genai import types
 
-# --------------------------------------------------
-# 設定
-# --------------------------------------------------
+# 本物のカレンダーUI（任意：入っていれば使う）
+CALENDAR_AVAILABLE = False
+try:
+    from streamlit_calendar import calendar as st_calendar
+    CALENDAR_AVAILABLE = True
+except Exception:
+    CALENDAR_AVAILABLE = False
 
+
+# ==================================================
+# 設定
+# ==================================================
 PROFILE_PATH = "profile.json"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -24,15 +34,13 @@ if GEMINI_API_KEY:
     except Exception:
         client = None
 
-# デフォルト座標（愛媛・瀬戸内あたりのイメージ）
 DEFAULT_LAT = 34.25
 DEFAULT_LON = 133.20
 
 
-# --------------------------------------------------
-# プロファイル保存まわり
-# --------------------------------------------------
-
+# ==================================================
+# プロフィール
+# ==================================================
 def default_profile() -> Dict[str, Any]:
     return {
         "age": None,
@@ -81,13 +89,8 @@ def save_profile(profile: Dict[str, Any]) -> None:
         with open(PROFILE_PATH, "w", encoding="utf-8") as f:
             json.dump(profile, f, ensure_ascii=False, indent=2)
     except Exception:
-        # 権限などで保存できない場合はスルー
         pass
 
-
-# --------------------------------------------------
-# ベースリスク計算
-# --------------------------------------------------
 
 def calc_bmi(height_cm: Optional[float], weight_kg: Optional[float]) -> Optional[float]:
     if not height_cm or not weight_kg or height_cm <= 0:
@@ -97,10 +100,6 @@ def calc_bmi(height_cm: Optional[float], weight_kg: Optional[float]) -> Optional
 
 
 def calc_profile_base_risk(profile: Dict[str, Any]) -> (int, List[str]):
-    """
-    プロファイルからベースリスク（体調の崩れやすさの土台）を計算
-    ※ 病気の診断ではありません
-    """
     score = 0
     reasons: List[str] = []
 
@@ -142,16 +141,10 @@ def calc_profile_base_risk(profile: Dict[str, Any]) -> (int, List[str]):
         score += 1
         reasons.append("こころの負担があり、睡眠やストレスの影響を受けやすい状態です。")
 
-    # ベーススコアの上限
-    if score > 3:
-        score = 3
-    return score, reasons
+    return min(score, 3), reasons
 
 
 def summarize_profile_for_gemini(profile: Dict[str, Any]) -> str:
-    """
-    Gemini に渡す用に、プロフィールを少しぼかして要約
-    """
     parts = []
 
     age = profile.get("age")
@@ -179,6 +172,7 @@ def summarize_profile_for_gemini(profile: Dict[str, Any]) -> str:
             parts.append("少しぽっちゃり")
         else:
             parts.append("ほぼ標準体型")
+
     chronic = profile.get("chronic", {})
     chronic_tags = []
     if chronic.get("migraine"):
@@ -204,31 +198,19 @@ def summarize_profile_for_gemini(profile: Dict[str, Any]) -> str:
     return " / ".join(parts)
 
 
-# --------------------------------------------------
-# Open-Meteo から気圧取得
-# --------------------------------------------------
-
+# ==================================================
+# 気圧取得（Open-Meteo）
+# ==================================================
 def fetch_pressure_from_open_meteo(latitude: float, longitude: float):
-    """
-    Open-Meteo から気圧（hourly）を取得
-    """
     url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "hourly": "pressure_msl",
-        "timezone": "auto",
-    }
-
+    params = {"latitude": latitude, "longitude": longitude, "hourly": "pressure_msl", "timezone": "auto"}
     try:
         resp = requests.get(url, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-
         hourly = data.get("hourly", {})
         times = hourly.get("time", [])
         pressures = hourly.get("pressure_msl", [])
-
         if not times or not pressures:
             return None, None, "気圧データが取得できませんでした。", None, None
 
@@ -245,14 +227,9 @@ def fetch_pressure_from_open_meteo(latitude: float, longitude: float):
             f"・約3時間前との差: {pressure_drop:+.1f} hPa"
         )
         return pressure_drop, latest, msg, times, pressures
-
     except Exception as e:
         return None, None, f"気圧データの取得に失敗しました: {e}", None, None
 
-
-# --------------------------------------------------
-# 日別の気圧リスク解析
-# --------------------------------------------------
 
 def classify_pressure_risk(max_drop_3h: float, min_pressure: float):
     score = 0
@@ -282,7 +259,7 @@ def classify_pressure_risk(max_drop_3h: float, min_pressure: float):
     return label, score, reasons
 
 
-def make_pressure_forecast(times, pressures, days_ahead: int = 5):
+def make_pressure_forecast(times, pressures, days_ahead: int = 14):
     if not times or not pressures:
         return []
 
@@ -301,12 +278,10 @@ def make_pressure_forecast(times, pressures, days_ahead: int = 5):
     results = []
     for d in target_dates:
         day_pressures = by_date[d]
-        if len(day_pressures) < 4:
-            min_p = min(day_pressures)
-            max_drop_3h = 0.0
-        else:
-            min_p = min(day_pressures)
-            max_drop_3h = 0.0
+        min_p = min(day_pressures)
+
+        max_drop_3h = 0.0
+        if len(day_pressures) >= 4:
             for i in range(3, len(day_pressures)):
                 drop = day_pressures[i] - day_pressures[i - 3]
                 if drop < max_drop_3h:
@@ -326,10 +301,9 @@ def make_pressure_forecast(times, pressures, days_ahead: int = 5):
     return results
 
 
-# --------------------------------------------------
-# 今日のリスク計算（状態＋気圧）
-# --------------------------------------------------
-
+# ==================================================
+# 今日のリスク
+# ==================================================
 def calc_daily_risk(
     sleep_hours: float,
     alcohol: bool,
@@ -369,7 +343,7 @@ def calc_daily_risk(
     if steps is not None:
         if steps < 2000:
             score += 1
-            reasons.append("前日の歩数が少なく、血行不良やだるさが出やすい状態です。")
+            reasons.append("前日の歩数が少なく、だるさが出やすい状態です。")
         elif steps > 15000:
             score += 1
             reasons.append("前日の活動量がかなり多く、疲れが残っているかもしれません。")
@@ -379,17 +353,16 @@ def calc_daily_risk(
 
 def classify_total_risk(total_score: int) -> (str, str, str):
     if total_score <= 2:
-        return "おちついている", "#2e7d32", "🟢"
+        return "おちついている", "#3CB371", "🟢"
     elif total_score <= 5:
-        return "少し注意したい", "#f9a825", "🟡"
+        return "少し注意したい", "#FFD54F", "🟡"
     else:
-        return "今日はかなり慎重に", "#c62828", "🔴"
+        return "今日はかなり慎重に", "#FF6B6B", "🔴"
 
 
-# --------------------------------------------------
-# Gemini アドバイス
-# --------------------------------------------------
-
+# ==================================================
+# Gemini
+# ==================================================
 def call_gemini_for_advice(
     profile_summary: str,
     risk_label: str,
@@ -422,7 +395,7 @@ def call_gemini_for_advice(
 - レベル: {risk_label}
 - トータルスコア: {total_score}（ベース {base_score} + 今日の条件 {daily_score}）
 
-【ベースリスクの理由（もともとの体質・持病など）】
+【ベースリスクの理由】
   {base_text}
 
 【今日の条件によるリスク要因】
@@ -433,131 +406,100 @@ def call_gemini_for_advice(
 - 前日のアルコール: {"あり" if alcohol else "なし"}
 - 直近3時間の気圧変化: {pressure_drop if pressure_drop is not None else "不明"} hPa
 - 安静時心拍の平常値との差: {resting_hr_diff} bpm
-- 前日の歩数（おおよそ）: {steps if steps is not None else "不明"}
-- 本人メモ・症状・予定:
+- 前日の歩数: {steps if steps is not None else "不明"}
+- 本人メモ:
   {user_note if user_note else "特になし"}
 
 【出力条件】
-- 日本語・ですます調で、やさしい言葉で書いてください。
+- 日本語・ですます調、やさしい言葉で。
 - 800字以内。
 - 構成：
-  1. 今日のからだの状態のイメージ（3〜5行）
-  2. 今日のおすすめの過ごし方（箇条書き3〜5個）
-  3. こんなサインが出たら受診を考えてほしい（2〜4個）
-- 市販薬や具体的な薬の名前は出さないでください。
-- 命にかかわる可能性がある症状が疑われる場合は
-  「早めに医療機関を受診することを検討してください」と必ず書いてください。
+  1) 今日の状態イメージ（3〜5行）
+  2) 今日のおすすめ（箇条書き3〜5）
+  3) 受診の目安（2〜4）
+- 薬の具体名は出さない。
+- 危険サインが疑われる場合は「早めに医療機関を受診することを検討してください」を入れる。
 """.strip()
 
     try:
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.4,
-            ),
+            config=types.GenerateContentConfig(temperature=0.4),
         )
         return response.text
     except Exception as e:
         return f"Geminiからのアドバイス取得に失敗しました。\nエラー概要: {e}"
 
 
-# --------------------------------------------------
-# UI・スタイル
-# --------------------------------------------------
-
-def inject_mobile_css():
+# ==================================================
+# UI（カラフル＆親しみ）
+# ==================================================
+def inject_colorful_css():
     css = """
     <style>
-    html, body, [class*="css"]  {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    .stApp {
+        background:
+          radial-gradient(circle at 15% 10%, rgba(255, 214, 102, 0.35), transparent 40%),
+          radial-gradient(circle at 85% 15%, rgba(186, 104, 200, 0.28), transparent 42%),
+          radial-gradient(circle at 20% 90%, rgba(129, 199, 132, 0.28), transparent 45%),
+          radial-gradient(circle at 90% 85%, rgba(79, 195, 247, 0.25), transparent 45%),
+          #fbfbff;
     }
-    .block-container {
-        padding-top: 1rem;
-        padding-bottom: 2rem;
-        padding-left: 1rem;
-        padding-right: 1rem;
-        max-width: 900px;
-        margin: auto;
+    html, body, [class*="css"]  { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+    .block-container { max-width: 980px; padding-top: 1rem; padding-bottom: 2rem; }
+    @media (max-width: 640px) { .block-container { padding-left: 0.7rem; padding-right: 0.7rem; } }
+
+    .wf-title {
+        font-size: 1.65rem;
+        font-weight: 800;
+        letter-spacing: 0.2px;
+        background: linear-gradient(90deg, #42a5f5, #ab47bc, #66bb6a);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        display: flex; gap: .4rem; align-items: center;
+        margin-bottom: .2rem;
     }
-    @media (max-width: 640px) {
-        .block-container {
-            padding-left: 0.6rem;
-            padding-right: 0.6rem;
-        }
-    }
-    .wf-header-title {
-        font-size: 1.4rem;
-        font-weight: 700;
-        display: flex;
-        align-items: center;
-        gap: 0.4rem;
-    }
-    .wf-header-sub {
-        font-size: 0.82rem;
+    .wf-sub {
+        font-size: 0.9rem;
         opacity: 0.85;
+        margin-bottom: .5rem;
     }
-    .wf-pill-tabs {
-        display: flex;
-        gap: 0.5rem;
-        margin-top: 0.8rem;
-        margin-bottom: 0.8rem;
-    }
-    .wf-pill {
-        flex: 1;
-        text-align: center;
-        padding: 0.5rem 0.6rem;
-        border-radius: 999px;
-        font-size: 0.85rem;
-        border: 1px solid #e0e0e0;
-        background: #ffffffee;
-    }
-    .wf-pill-active {
-        background: linear-gradient(120deg, #4caf50, #81c784);
-        color: #fff;
-        border-color: transparent;
-        box-shadow: 0 4px 10px rgba(76,175,80,0.3);
-    }
-    .wf-risk-card {
+
+    .wf-card {
+        background: rgba(255,255,255,0.85);
+        border: 1px solid rgba(0,0,0,0.06);
         border-radius: 18px;
-        padding: 14px 16px;
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
+        padding: 12px 14px;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.05);
+        margin-top: .6rem;
     }
-    .wf-risk-main {
-        font-size: 1.05rem;
-        font-weight: 600;
-        display: flex;
-        align-items: center;
-        gap: 0.35rem;
+
+    .wf-section {
+        font-size: 1.02rem;
+        font-weight: 750;
+        margin-top: 1rem;
+        margin-bottom: .4rem;
+        display:flex; align-items:center; gap:.35rem;
     }
-    .wf-risk-sub {
-        font-size: 0.85rem;
-        opacity: 0.9;
+
+    /* ボタンを少しポップに */
+    .stButton>button {
+        border-radius: 14px !important;
+        padding: 0.55rem 0.8rem !important;
+        font-weight: 700 !important;
+        border: 1px solid rgba(0,0,0,0.08) !important;
+        box-shadow: 0 6px 16px rgba(0,0,0,0.05) !important;
     }
-    .wf-section-title {
-        font-size: 0.95rem;
-        font-weight: 600;
-        margin-top: 1.0rem;
-        margin-bottom: 0.3rem;
-    }
-    .wf-forecast-item {
-        padding: 0.6rem 0.2rem;
-        border-bottom: 1px solid rgba(0,0,0,0.06);
-        font-size: 0.86rem;
-    }
-    .wf-forecast-item:last-child {
-        border-bottom: none;
-    }
-    .wf-forecast-date {
-        font-weight: 600;
-        margin-right: 0.3rem;
-    }
-    .wf-forecast-reasons {
-        font-size: 0.78rem;
-        opacity: 0.9;
-        margin-left: 1.4rem;
+
+    /* FullCalendarを大きく */
+    .fc { font-size: 1.05rem; }
+    .fc .fc-toolbar-title { font-size: 1.25rem; font-weight: 800; }
+    .fc .fc-daygrid-day-number { font-weight: 800; }
+    .fc .fc-daygrid-day-frame { min-height: 92px; }  /* ここが「大きめ」の肝 */
+    @media (max-width: 640px) {
+        .fc { font-size: 0.95rem; }
+        .fc .fc-daygrid-day-frame { min-height: 78px; }
     }
     </style>
     """
@@ -565,52 +507,136 @@ def inject_mobile_css():
 
 
 def risk_card(label: str, color: str, emoji: str, total_score: int, base_score: int, daily_score: int):
-    bg = f"{color}20"
-    html = f"""
-    <div class="wf-risk-card" style="background-color:{bg}; border: 1px solid {color}33;">
-      <div class="wf-risk-main">
-        <span>{emoji}</span>
-        <span>きょうの体調リスク：{label}</span>
-      </div>
-      <div class="wf-risk-sub">
-        スコア合計 <b>{total_score}</b>（ベース {base_score} ＋ 今日の条件 {daily_score}）
-      </div>
-    </div>
-    """
-    st.markdown(html, unsafe_allow_html=True)
+    bg = f"{color}22"
+    st.markdown(
+        f"""
+        <div class="wf-card" style="border-color:{color}44;background:{bg};">
+          <div style="font-size:1.05rem;font-weight:800;display:flex;gap:.4rem;align-items:center;">
+            <span style="font-size:1.2rem;">{emoji}</span>
+            <span>きょうの体調リスク：{label}</span>
+          </div>
+          <div style="opacity:.9;margin-top:.2rem;">
+            スコア合計 <b>{total_score}</b>（ベース {base_score} ＋ 今日の条件 {daily_score}）
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
-# --------------------------------------------------
-# プロファイルタブ UI
-# --------------------------------------------------
+# ==================================================
+# 予報 → “本物カレンダー”用イベント生成
+# ==================================================
+def forecast_to_events(forecast_days: List[Dict[str, Any]]) -> (List[Dict[str, Any]], Dict[str, Dict[str, Any]]):
+    events = []
+    index = {}
+    for d in forecast_days:
+        date_obj: dt.date = d["date"]
+        date_str = date_obj.isoformat()
+        label = d["label"]
 
+        if label == "低め":
+            title = "🟢 低め"
+            bg = "#B7F0C1"
+            border = "#57C46A"
+        elif label == "やや高め":
+            title = "🟡 やや高め"
+            bg = "#FFF2B2"
+            border = "#F4C44E"
+        else:
+            title = "🔴 高め"
+            bg = "#FFD1D9"
+            border = "#FF6B6B"
+
+        events.append(
+            {
+                "title": title,
+                "start": date_str,
+                "end": date_str,
+                "allDay": True,
+                "backgroundColor": bg,
+                "borderColor": border,
+                "textColor": "#1f1f1f",
+                "extendedProps": {
+                    "label": label,
+                    "min_pressure": float(d["min_pressure"]),
+                    "max_drop_3h": float(d["max_drop_3h"]),
+                    "reasons": d["reasons"],
+                },
+            }
+        )
+        index[date_str] = d
+    return events, index
+
+
+# ==================================================
+# フォールバック（簡易カレンダーHTML）
+# ==================================================
+def build_simple_calendar_html(forecast_days: List[Dict[str, Any]]) -> str:
+    if not forecast_days:
+        return "<div class='wf-card'>予報データがありません。</div>"
+
+    by_date = {d["date"]: d for d in forecast_days}
+    first_date = forecast_days[0]["date"]
+    year, month = first_date.year, first_date.month
+
+    cal = pycal.Calendar(firstweekday=6)  # 日曜はじまり
+    weeks = cal.monthdayscalendar(year, month)
+    week_labels = ["日", "月", "火", "水", "木", "金", "土"]
+
+    html = f"<div class='wf-card'><div style='font-weight:800;margin-bottom:.4rem'>{year}年{month}月（簡易表示）</div>"
+    html += "<table style='width:100%;border-collapse:collapse;table-layout:fixed;border-radius:14px;overflow:hidden;'>"
+    html += "<tr>"
+    for w in week_labels:
+        html += f"<th style='background:#E1BEE7;padding:.4rem;font-size:.9rem'>{w}</th>"
+    html += "</tr>"
+
+    for week in weeks:
+        html += "<tr>"
+        for day in week:
+            if day == 0:
+                html += "<td style='background:rgba(0,0,0,0.03);height:76px'></td>"
+                continue
+            cur = dt.date(year, month, day)
+            info = by_date.get(cur)
+            if not info:
+                html += f"<td style='background:rgba(0,0,0,0.04);height:76px;padding:.2rem;vertical-align:top'><b>{day}</b><div style='opacity:.6'>—</div></td>"
+            else:
+                label = info["label"]
+                if label == "低め":
+                    bg, em = "#B7F0C1", "🟢"
+                elif label == "やや高め":
+                    bg, em = "#FFF2B2", "🟡"
+                else:
+                    bg, em = "#FFD1D9", "🔴"
+                html += f"<td style='background:{bg};height:76px;padding:.2rem;vertical-align:top'><b>{day}</b><div style='font-weight:700'>{em} {label}</div></td>"
+        html += "</tr>"
+
+    html += "</table></div>"
+    return html
+
+
+# ==================================================
+# プロフィールUI
+# ==================================================
 def profile_tab_ui(profile: Dict[str, Any]) -> Dict[str, Any]:
-    st.markdown("#### プロフィール（からだの基本情報）")
+    st.markdown('<div class="wf-section">🧑‍⚕️ プロフィール</div>', unsafe_allow_html=True)
+    st.markdown('<div class="wf-card">体調の「崩れやすさ」の土台を作るための情報です。任意のものは空でもOKです。</div>', unsafe_allow_html=True)
 
     col1, col2 = st.columns(2)
     with col1:
-        age = st.number_input("年齢", min_value=0, max_value=120,
-                              value=int(profile["age"]) if profile["age"] is not None else 40)
-        height_cm = st.number_input(
-            "身長（cm）", min_value=0.0, max_value=250.0,
-            value=float(profile["height_cm"]) if profile["height_cm"] is not None else 170.0,
-            step=0.5,
-        )
+        age = st.number_input("年齢", min_value=0, max_value=120, value=int(profile["age"]) if profile["age"] is not None else 40)
+        height_cm = st.number_input("身長（cm）", min_value=0.0, max_value=250.0,
+                                    value=float(profile["height_cm"]) if profile["height_cm"] is not None else 170.0, step=0.5)
     with col2:
-        weight_kg = st.number_input(
-            "体重（kg）", min_value=0.0, max_value=300.0,
-            value=float(profile["weight_kg"]) if profile["weight_kg"] is not None else 60.0,
-            step=0.5,
-        )
+        weight_kg = st.number_input("体重（kg）", min_value=0.0, max_value=300.0,
+                                    value=float(profile["weight_kg"]) if profile["weight_kg"] is not None else 60.0, step=0.5)
         blood_type = st.text_input("血液型（任意）", value=profile.get("blood_type", ""))
 
-    sex = st.selectbox(
-        "性別（任意）",
-        ["未設定", "男性", "女性", "その他"],
-        index=["未設定", "男性", "女性", "その他"].index(profile.get("sex", "未設定")),
-    )
+    sex = st.selectbox("性別（任意）", ["未設定", "男性", "女性", "その他"],
+                       index=["未設定", "男性", "女性", "その他"].index(profile.get("sex", "未設定")))
 
-    st.markdown("##### 慢性的な病気（あてはまるものにチェック）")
+    st.markdown("##### 慢性的なもの（当てはまる場合だけ）")
     ch = profile["chronic"]
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -627,145 +653,102 @@ def profile_tab_ui(profile: Dict[str, Any]) -> Dict[str, Any]:
 
     st.markdown("##### アレルギー")
     al = profile["allergy"]
-    al["nsaids"] = st.checkbox("ロキソニンなどの痛み止めでアレルギーが出たことがある", value=al.get("nsaids", False))
+    al["nsaids"] = st.checkbox("痛み止め（NSAIDs）で強い副反応/アレルギーが出たことがある", value=al.get("nsaids", False))
     al["antibiotics"] = st.checkbox("抗生物質でアレルギーが出たことがある", value=al.get("antibiotics", False))
     al["food"] = st.text_input("食べ物のアレルギー（あれば）", value=al.get("food", ""))
-    al["others"] = st.text_input("その他のアレルギー（あれば）", value=al.get("others", ""))
+    al["others"] = st.text_input("その他（あれば）", value=al.get("others", ""))
 
-    save_col, _ = st.columns([1, 1])
-    with save_col:
-        if st.button("プロフィールを保存する", use_container_width=True):
-            profile["age"] = int(age)
-            profile["sex"] = sex
-            profile["height_cm"] = float(height_cm) if height_cm > 0 else None
-            profile["weight_kg"] = float(weight_kg) if weight_kg > 0 else None
-            profile["blood_type"] = blood_type
-            profile["chronic"] = ch
-            profile["allergy"] = al
-            save_profile(profile)
-            st.success("プロフィールを保存しました。次回以降もこの情報が使われます。")
+    if st.button("💾 プロフィールを保存する", use_container_width=True):
+        profile["age"] = int(age)
+        profile["sex"] = sex
+        profile["height_cm"] = float(height_cm) if height_cm > 0 else None
+        profile["weight_kg"] = float(weight_kg) if weight_kg > 0 else None
+        profile["blood_type"] = blood_type
+        profile["chronic"] = ch
+        profile["allergy"] = al
+        save_profile(profile)
+        st.success("保存しました！次回以降もこの情報を使って予測します。")
 
     bmi = calc_bmi(profile.get("height_cm"), profile.get("weight_kg"))
     if bmi is not None:
         st.info(f"BMI（目安）: {bmi:.1f}")
 
     base_score, base_reasons = calc_profile_base_risk(profile)
-    st.markdown('<div class="wf-section-title">プロフィールから見た「崩れやすさ」の傾向</div>', unsafe_allow_html=True)
-    st.write(f"ベースリスクスコア: {base_score}（0〜3）")
+    st.markdown('<div class="wf-section">🧩 ベースの崩れやすさ</div>', unsafe_allow_html=True)
+    st.markdown(f"<div class='wf-card'>ベーススコア：<b>{base_score}</b>（0〜3）</div>", unsafe_allow_html=True)
     if base_reasons:
+        st.write("理由：")
         for r in base_reasons:
             st.write(f"- {r}")
     else:
-        st.write("今の登録内容からは、特に大きなベースリスクは見つかりません。")
+        st.write("今の登録内容では、強いベース要因は見つかりません。")
 
     return profile
 
 
-# --------------------------------------------------
-# メインアプリ
-# --------------------------------------------------
-
+# ==================================================
+# メイン
+# ==================================================
 def main():
     st.set_page_config(page_title="Wellness Forecast", page_icon="🩺", layout="wide")
-    inject_mobile_css()
+    inject_colorful_css()
 
     if "profile" not in st.session_state:
         st.session_state.profile = load_profile()
-    profile = st.session_state.profile
-
     if "active_tab" not in st.session_state:
         st.session_state.active_tab = "today"
+    profile = st.session_state.profile
 
     # ヘッダー
-    header_col1, header_col2 = st.columns([3, 2])
-    with header_col1:
-        st.markdown(
-            '<div class="wf-header-title">🩺 Wellness Forecast</div>'
-            '<div class="wf-header-sub">気圧と生活リズムから、きょうの「崩れやすさ」をそっとお知らせするアプリです。</div>',
-            unsafe_allow_html=True,
-        )
-    with header_col2:
-        st.write("")
+    st.markdown('<div class="wf-title">🩺 Wellness Forecast</div>', unsafe_allow_html=True)
+    st.markdown('<div class="wf-sub">気圧×生活リズムで、体調の「崩れやすさ」をカレンダーで見える化します。</div>', unsafe_allow_html=True)
+    st.markdown("<div class='wf-card'>※体調管理の目安です。強い症状があるときはスコアに関係なく医療機関の受診を検討してください。</div>", unsafe_allow_html=True)
 
-    st.caption(
-        "※このアプリは、体調管理の目安として使うためのものです。"
-        " 病気の診断や治療に代わるものではありません。"
-    )
-
-    # タブ切り替え
-    pill_col1, pill_col2 = st.columns(2)
-    with pill_col1:
-        if st.button("きょうのようす", key="tab_today_btn", use_container_width=True):
+    # タブ
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🌈 きょうのようす", use_container_width=True):
             st.session_state.active_tab = "today"
-    with pill_col2:
-        if st.button("プロフィール", key="tab_profile_btn", use_container_width=True):
+    with c2:
+        if st.button("🧑‍⚕️ プロフィール", use_container_width=True):
             st.session_state.active_tab = "profile"
 
-    if st.session_state.active_tab == "today":
-        pill_html = """
-        <div class="wf-pill-tabs">
-          <div class="wf-pill wf-pill-active">きょうのようす</div>
-          <div class="wf-pill">プロフィール</div>
-        </div>
-        """
-    else:
-        pill_html = """
-        <div class="wf-pill-tabs">
-          <div class="wf-pill">きょうのようす</div>
-          <div class="wf-pill wf-pill-active">プロフィール</div>
-        </div>
-        """
-    st.markdown(pill_html, unsafe_allow_html=True)
-
-    # プロファイルタブ
     if st.session_state.active_tab == "profile":
-        profile = profile_tab_ui(profile)
-        st.session_state.profile = profile
+        st.session_state.profile = profile_tab_ui(profile)
         return
 
-    # きょうのようすタブ
-    today = dt.date.today()
-    st.write(f"本日の日付：{today}")
+    # --- 今日 ---
+    st.markdown('<div class="wf-section">🌤️ きょうの入力</div>', unsafe_allow_html=True)
 
-    # 1. 気圧
-    st.markdown('<div class="wf-section-title">1. 気圧の情報（Open-Meteo）</div>', unsafe_allow_html=True)
-    col_loc1, col_loc2, col_loc3 = st.columns([1.3, 1.3, 1])
-    with col_loc1:
-        latitude = st.number_input("緯度（latitude）", -90.0, 90.0, DEFAULT_LAT, 0.01)
-    with col_loc2:
-        longitude = st.number_input("経度（longitude）", -180.0, 180.0, DEFAULT_LON, 0.01)
-    with col_loc3:
-        use_auto_pressure = st.checkbox("APIから自動取得する", value=True)
+    # 気圧
+    with st.container():
+        st.markdown("<div class='wf-card'>📍 場所（気圧を取る場所です）</div>", unsafe_allow_html=True)
+        colA, colB, colC = st.columns([1.2, 1.2, 1])
+        with colA:
+            latitude = st.number_input("緯度", -90.0, 90.0, DEFAULT_LAT, 0.01)
+        with colB:
+            longitude = st.number_input("経度", -180.0, 180.0, DEFAULT_LON, 0.01)
+        with colC:
+            use_auto_pressure = st.checkbox("APIで自動取得", value=True)
 
-    # 2. 今日の状態
-    st.markdown('<div class="wf-section-title">2. きょうのからだの状態</div>', unsafe_allow_html=True)
+    # 今日の状態
+    st.markdown("<div class='wf-card'>🧸 きょうの体調メモ（だいたいでOK）</div>", unsafe_allow_html=True)
     col1, col2 = st.columns(2)
-
     with col1:
         sleep_hours = st.number_input("昨夜の睡眠時間（時間）", 0.0, 15.0, 6.0, 0.5)
         alcohol = st.checkbox("きのうお酒を飲んだ", value=False)
-        steps = st.number_input("きのうの歩数（だいたいでOK・0なら不明扱い）", 0, 50000, 6000, 500)
-        steps = steps if steps > 0 else None
-
+        steps_raw = st.number_input("きのうの歩数（0なら不明）", 0, 50000, 6000, 500)
+        steps = steps_raw if steps_raw > 0 else None
     with col2:
-        manual_pressure_drop = st.number_input(
-            "直近3時間の気圧変化 [hPa]（マイナスで低下。APIが使えないときの予備）",
-            -20.0, 20.0, 0.0, 0.1
-        )
-        resting_hr_diff = st.number_input(
-            "安静時心拍（ふだんとの差）[bpm]",
-            -30.0, 30.0, 0.0, 1.0
-        )
+        manual_pressure_drop = st.number_input("直近3時間の気圧変化[hPa]（API不調のとき）", -20.0, 20.0, 0.0, 0.1)
+        resting_hr_diff = st.number_input("安静時心拍（ふだんとの差）[bpm]", -30.0, 30.0, 0.0, 1.0)
 
-    user_note = st.text_area(
-        "きょう気になっている症状・予定など（任意）",
-        placeholder="例）左側の頭がズキズキする／午後から外出／鼻づまりがつらい、など"
-    )
+    user_note = st.text_area("気になる症状・予定（任意）", placeholder="例）片側の頭がズキズキ／鼻づまり／今日は冷えた… など")
 
     st.markdown("---")
 
-    if st.button("きょうのリスクと数日予報を見る", use_container_width=True):
-        # 気圧
+    # 実行
+    if st.button("✨ きょうのリスク＋カレンダー予報を見る", use_container_width=True):
         pressure_drop = manual_pressure_drop
         latest_pressure = None
         times = None
@@ -773,123 +756,121 @@ def main():
 
         if use_auto_pressure:
             with st.spinner("気圧データを取得しています…"):
-                p_drop, latest, msg, times, pressures = fetch_pressure_from_open_meteo(
-                    latitude, longitude
-                )
+                p_drop, latest, msg, times, pressures = fetch_pressure_from_open_meteo(latitude, longitude)
             st.info(msg)
             if p_drop is not None:
                 pressure_drop = p_drop
             if latest is not None:
                 latest_pressure = latest
 
-        # ベース＋今日のスコア
+        # 今日のリスク
         base_score, base_reasons = calc_profile_base_risk(profile)
-        daily_score, daily_reasons = calc_daily_risk(
-            sleep_hours,
-            alcohol,
-            pressure_drop,
-            resting_hr_diff,
-            steps,
-        )
+        daily_score, daily_reasons = calc_daily_risk(sleep_hours, alcohol, pressure_drop, resting_hr_diff, steps)
         total_score = base_score + daily_score
         label, color, emoji = classify_total_risk(total_score)
 
-        # 3. 今日の総合リスク
-        st.markdown('<div class="wf-section-title">3. きょうの総合リスク</div>', unsafe_allow_html=True)
+        st.markdown('<div class="wf-section">🧡 きょうの結果</div>', unsafe_allow_html=True)
         risk_card(label, color, emoji, total_score, base_score, daily_score)
 
+        st.markdown("<div class='wf-card'>", unsafe_allow_html=True)
         if latest_pressure is not None:
-            st.write(f"現在の気圧（参考値）: {latest_pressure:.1f} hPa")
+            st.write(f"現在の気圧（参考）: {latest_pressure:.1f} hPa")
         st.write(f"直近3時間の気圧変化（判定に使用）: {pressure_drop:+.1f} hPa")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown('<div class="wf-section-title">ベースリスク（もともとの体質・持病など）</div>', unsafe_allow_html=True)
+        st.markdown('<div class="wf-section">🧩 理由（ざっくり）</div>', unsafe_allow_html=True)
+        st.markdown("<div class='wf-card'>", unsafe_allow_html=True)
+        st.write("ベース（プロフィール）:")
         if base_reasons:
             for r in base_reasons:
                 st.write(f"- {r}")
         else:
-            st.write("登録されている情報からは、大きなベースリスクは見つかりません。")
+            st.write("- 目立つベース要因は少なめです。")
 
-        st.markdown('<div class="wf-section-title">きょうの追加リスク（睡眠・気圧など）</div>', unsafe_allow_html=True)
+        st.write("\nきょう（睡眠・気圧など）:")
         if daily_reasons:
             for r in daily_reasons:
                 st.write(f"- {r}")
         else:
-            st.write("きょうの条件からは、大きな追加リスクは検出されませんでした。")
+            st.write("- 大きな追加要因は少なめです。")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        # 4. Gemini アドバイス
-        st.markdown("---")
-        st.markdown('<div class="wf-section-title">4. AIからのやさしいアドバイス（Gemini）</div>', unsafe_allow_html=True)
-        profile_summary = summarize_profile_for_gemini(profile)
-
+        # Gemini
+        st.markdown('<div class="wf-section">🤖 AIのやさしいアドバイス</div>', unsafe_allow_html=True)
         if client is None:
-            st.info(
-                "Gemini の API キーが設定されていないため、AIからのアドバイスは表示できません。"
-                " 環境変数 GEMINI_API_KEY を設定すると、ここにコメントが表示されます。"
-            )
+            st.markdown("<div class='wf-card'>GeminiのAPIキーが未設定のため、AIコメントはオフです（GEMINI_API_KEYを設定すると有効になります）。</div>", unsafe_allow_html=True)
         else:
-            with st.spinner("きょうの過ごし方について考えています…"):
-                gemini_text = call_gemini_for_advice(
-                    profile_summary,
-                    label,
-                    total_score,
-                    base_score,
-                    daily_score,
-                    base_reasons,
-                    daily_reasons,
-                    sleep_hours,
-                    alcohol,
-                    pressure_drop,
-                    resting_hr_diff,
-                    steps,
-                    user_note,
+            profile_summary = summarize_profile_for_gemini(profile)
+            with st.spinner("アドバイスを作成中…"):
+                txt = call_gemini_for_advice(
+                    profile_summary, label, total_score, base_score, daily_score,
+                    base_reasons, daily_reasons, sleep_hours, alcohol,
+                    pressure_drop, resting_hr_diff, steps, user_note
                 )
-            st.write(gemini_text)
+            st.markdown(f"<div class='wf-card'>{txt}</div>", unsafe_allow_html=True)
 
-        # 5. 数日予報
-        st.markdown("---")
-        st.markdown('<div class="wf-section-title">5. 気圧から見た数日先のリスク予報</div>', unsafe_allow_html=True)
+        # 予報（本物カレンダー）
+        st.markdown('<div class="wf-section">🗓️ 予報カレンダー（気圧ベース）</div>', unsafe_allow_html=True)
 
         if times is None or pressures is None:
-            st.info("気圧データがないため、数日予報は表示できません。")
+            st.markdown("<div class='wf-card'>気圧データがないため、カレンダー予報は表示できません。</div>", unsafe_allow_html=True)
+            return
+
+        forecast_days = make_pressure_forecast(times, pressures, days_ahead=14)  # 2週間くらい
+        if not forecast_days:
+            st.markdown("<div class='wf-card'>予報を計算できませんでした。</div>", unsafe_allow_html=True)
+            return
+
+        events, index = forecast_to_events(forecast_days)
+
+        if CALENDAR_AVAILABLE:
+            st.markdown("<div class='wf-card'>📌 日付をタップすると、その日の理由が下に出ます。</div>", unsafe_allow_html=True)
+
+            options = {
+                "initialView": "dayGridMonth",
+                "locale": "ja",
+                "height": 780,  # 大きめ
+                "headerToolbar": {"left": "prev,next today", "center": "title", "right": "dayGridMonth,listWeek"},
+                "dayMaxEventRows": True,
+            }
+
+            cal_state = st_calendar(events=events, options=options, key="wf_fullcalendar")
+
+            # クリックされたイベントの詳細表示（選択イベントが返ってくる）
+            selected = None
+            if isinstance(cal_state, dict):
+                selected = cal_state.get("eventClick") or cal_state.get("event")
+
+            if selected and isinstance(selected, dict):
+                start = selected.get("start", "")
+                date_str = start[:10] if start else ""
+                info = index.get(date_str)
+                if info:
+                    st.markdown("<div class='wf-card'>", unsafe_allow_html=True)
+                    st.write(f"📅 {date_str} の予報：**{info['label']}**")
+                    st.write(f"・最低気圧（目安）: {info['min_pressure']:.1f} hPa")
+                    st.write(f"・3時間あたり最大変化: {info['max_drop_3h']:+.1f} hPa")
+                    if info["reasons"]:
+                        st.write("理由：")
+                        for r in info["reasons"]:
+                            st.write(f"- {r}")
+                    st.markdown("</div>", unsafe_allow_html=True)
         else:
-            forecast_days = make_pressure_forecast(times, pressures, days_ahead=7)
-            if not forecast_days:
-                st.write("数日分の気圧予報を計算できませんでした。")
-            else:
-                for day_info in forecast_days:
-                    d = day_info["date"]
-                    d_label = day_info["label"]
-                    max_drop = day_info["max_drop_3h"]
-                    min_p = day_info["min_pressure"]
-                    reasons_f = day_info["reasons"]
+            st.markdown(
+                "<div class='wf-card'>"
+                "本物のカレンダー表示を使うには、次を実行してください：<br>"
+                "<code>pip install streamlit-calendar</code><br>"
+                "いまは簡易カレンダーで表示します。</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(build_simple_calendar_html(forecast_days), unsafe_allow_html=True)
 
-                    if d_label == "低め":
-                        icon = "🟢"
-                    elif d_label == "やや高め":
-                        icon = "🟡"
-                    else:
-                        icon = "🔴"
-
-                    st.markdown(
-                        f'<div class="wf-forecast-item">'
-                        f'<span class="wf-forecast-date">{d}</span>'
-                        f'{icon} {d_label} '
-                        f'(3時間あたり最大変化: {max_drop:+.1f} hPa, 最低気圧: {min_p:.1f} hPa)'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-                    if reasons_f:
-                        for r in reasons_f:
-                            st.markdown(
-                                f'<div class="wf-forecast-reasons">- {r}</div>',
-                                unsafe_allow_html=True,
-                            )
-
-        st.caption(
-            "このアプリは、体調のセルフチェックをお手伝いするためのものです。"
-            " 強い頭痛や胸の痛み、息苦しさ、ろれつが回らない、片側の手足が動きにくい、"
-            " 意識がもうろうとする、といった症状があるときは、スコアに関係なく"
-            " 早めに医療機関を受診してください。"
+        st.markdown(
+            "<div class='wf-card'>"
+            "🆘 強い頭痛、胸の痛み、息苦しさ、ろれつが回らない、片側の手足が動きにくい、意識がもうろう… "
+            "などがある場合は、スコアに関係なく早めに医療機関の受診を検討してください。"
+            "</div>",
+            unsafe_allow_html=True,
         )
 
 
