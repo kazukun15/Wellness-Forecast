@@ -85,7 +85,6 @@ def load_profile() -> Dict[str, Any]:
             base = default_profile()
             base.update(data)
 
-            # ensure nested keys
             for k, v in default_profile()["chronic"].items():
                 base["chronic"].setdefault(k, v)
             for k, v in default_profile()["allergy"].items():
@@ -158,8 +157,8 @@ def calc_profile_base_risk(profile: Dict[str, Any]) -> Tuple[int, List[str]]:
 
 def summarize_profile_for_gemini(profile: Dict[str, Any]) -> str:
     parts = []
-
     age = profile.get("age")
+
     if age is not None:
         if age < 30:
             parts.append("20〜30代前半")
@@ -265,7 +264,6 @@ def fetch_weather_from_open_meteo(latitude: float, longitude: float) -> Tuple[Op
         if len(pressures) >= 4:
             pressure_drop_3h = latest_p - float(pressures[-4])
 
-        # latest weather snapshot
         def latest_float(key: str) -> Optional[float]:
             s = series.get(key)
             if not s:
@@ -319,7 +317,6 @@ def calc_daily_risk(
     score = 0
     reasons: List[str] = []
 
-    # pressure
     if pressure_drop_3h is not None:
         if pressure_drop_3h <= -4:
             score += 2
@@ -328,7 +325,6 @@ def calc_daily_risk(
             score += 1
             reasons.append("直近3時間で2〜4hPa程度の気圧低下がありそうです。")
 
-    # sleep
     if sleep_hours < 5.5:
         score += 2
         reasons.append("睡眠がかなり少なめ（5.5時間未満）です。")
@@ -336,12 +332,10 @@ def calc_daily_risk(
         score += 1
         reasons.append("睡眠が少し少なめ（6.5時間未満）です。")
 
-    # alcohol
     if alcohol:
         score += 1
         reasons.append("前日にお酒があり、体の負担が残ることがあります。")
 
-    # resting HR diff
     if resting_hr_diff >= 8:
         score += 2
         reasons.append("安静時心拍がいつもより8bpm以上高めです。")
@@ -349,7 +343,6 @@ def calc_daily_risk(
         score += 1
         reasons.append("安静時心拍が少し高めです。")
 
-    # steps
     if steps is not None:
         if steps < 2000:
             score += 1
@@ -362,11 +355,6 @@ def calc_daily_risk(
 
 
 def add_weather_risk_from_latest(hourly: Dict[str, Any]) -> Tuple[int, List[str], Dict[str, Optional[float]]]:
-    """
-    latest hourly values -> extra risk
-    returns:
-      score, reasons, snapshot dict for UI
-    """
     score = 0
     reasons: List[str] = []
 
@@ -387,7 +375,7 @@ def add_weather_risk_from_latest(hourly: Dict[str, Any]) -> Tuple[int, List[str]
 
     ref = feels if feels is not None else temp
 
-    # temperature (mild weights)
+    # 気温/体感（重みは控えめ）
     if ref is not None:
         if ref <= 0:
             score += 2
@@ -402,7 +390,7 @@ def add_weather_risk_from_latest(hourly: Dict[str, Any]) -> Tuple[int, List[str]
             score += 1
             reasons.append("体感が暑め（30℃以上）で、負担が増えやすいです。")
 
-    # humidity
+    # 湿度
     if rh is not None:
         if rh <= 25:
             score += 1
@@ -411,7 +399,7 @@ def add_weather_risk_from_latest(hourly: Dict[str, Any]) -> Tuple[int, List[str]
             score += 1
             reasons.append("湿度が高め（80%以上）で、だるさが出やすいです。")
 
-    # precipitation
+    # 降水
     if prec is not None:
         if prec >= 5:
             score += 2
@@ -420,7 +408,7 @@ def add_weather_risk_from_latest(hourly: Dict[str, Any]) -> Tuple[int, List[str]
             score += 1
             reasons.append("雨（降水）があり、負担が増えやすいです。")
 
-    # wind
+    # 風
     if wind is not None:
         if wind >= 10:
             score += 2
@@ -449,7 +437,7 @@ def classify_total_risk(total_score: int) -> Tuple[str, str, str]:
 
 
 # ==================================================
-# Forecast (daily risk from hourly series)
+# Forecast (daily from hourly series)
 # ==================================================
 def _parse_iso(ts: str) -> Optional[datetime]:
     try:
@@ -459,19 +447,10 @@ def _parse_iso(ts: str) -> Optional[datetime]:
 
 
 def build_daily_forecast_from_hourly(series: Dict[str, Any], days_ahead: int = 14) -> List[Dict[str, Any]]:
-    """
-    Creates day-level forecast combining:
-      - pressure risk (drop and low pressure)
-      - temperature extremes and daily range
-      - humidity extremes
-      - precipitation sum
-      - max wind
-    """
     times = series.get("time", [])
     if not times:
         return []
 
-    # Build date -> indices
     idx_by_date: Dict[dt.date, List[int]] = {}
     for i, t in enumerate(times):
         dtt = _parse_iso(t)
@@ -500,7 +479,6 @@ def build_daily_forecast_from_hourly(series: Dict[str, Any], days_ahead: int = 1
         if not idxs:
             continue
 
-        # pressure stats
         pressures = [get_f("pressure_msl", i) for i in idxs]
         pressures = [p for p in pressures if p is not None]
         if not pressures:
@@ -508,9 +486,7 @@ def build_daily_forecast_from_hourly(series: Dict[str, Any], days_ahead: int = 1
 
         min_pressure = float(min(pressures))
 
-        # max drop over 3 hours within the day (hourly steps)
         max_drop_3h = 0.0
-        # compute by stepping on raw hourly array positions
         for j in range(3, len(idxs)):
             p_now = get_f("pressure_msl", idxs[j])
             p_prev = get_f("pressure_msl", idxs[j - 3])
@@ -520,7 +496,6 @@ def build_daily_forecast_from_hourly(series: Dict[str, Any], days_ahead: int = 1
             if drop < max_drop_3h:
                 max_drop_3h = drop
 
-        # temperature stats
         temps = [get_f("temperature_2m", i) for i in idxs]
         temps = [t for t in temps if t is not None]
         feels = [get_f("apparent_temperature", i) for i in idxs]
@@ -532,7 +507,6 @@ def build_daily_forecast_from_hourly(series: Dict[str, Any], days_ahead: int = 1
         wind = [get_f("wind_speed_10m", i) for i in idxs]
         wind = [t for t in wind if t is not None]
 
-        # derived
         min_temp = float(min(temps)) if temps else None
         max_temp = float(max(temps)) if temps else None
         min_feels = float(min(feels)) if feels else None
@@ -542,11 +516,10 @@ def build_daily_forecast_from_hourly(series: Dict[str, Any], days_ahead: int = 1
         prec_sum = float(sum(prec)) if prec else 0.0
         wind_max = float(max(wind)) if wind else None
 
-        # Risk scoring for the day
         score = 0
         reasons: List[str] = []
 
-        # pressure part (same spirit as earlier)
+        # 気圧
         if max_drop_3h <= -6.0:
             score += 2
             reasons.append("3時間で6hPa以上の急な気圧低下がありそうです。")
@@ -561,7 +534,7 @@ def build_daily_forecast_from_hourly(series: Dict[str, Any], days_ahead: int = 1
             score += 1
             reasons.append("気圧が1005hPa未満の時間帯がありそうです。")
 
-        # temperature extremes (use apparent if available)
+        # 体感温度優先
         ref_min = min_feels if min_feels is not None else min_temp
         ref_max = max_feels if max_feels is not None else max_temp
 
@@ -572,6 +545,7 @@ def build_daily_forecast_from_hourly(series: Dict[str, Any], days_ahead: int = 1
             elif ref_min <= 5:
                 score += 1
                 reasons.append("体感が寒め（5℃以下）の時間帯がありそうです。")
+
         if ref_max is not None:
             if ref_max >= 33:
                 score += 2
@@ -580,7 +554,7 @@ def build_daily_forecast_from_hourly(series: Dict[str, Any], days_ahead: int = 1
                 score += 1
                 reasons.append("体感が暑め（30℃以上）の時間帯がありそうです。")
 
-        # daily temp swing
+        # 日内気温差
         if min_temp is not None and max_temp is not None:
             swing = max_temp - min_temp
             if swing >= 12:
@@ -590,7 +564,7 @@ def build_daily_forecast_from_hourly(series: Dict[str, Any], days_ahead: int = 1
                 score += 1
                 reasons.append("日内の気温差がやや大きめ（8℃以上）です。")
 
-        # humidity extremes
+        # 湿度極端
         if min_rh is not None and min_rh <= 25:
             score += 1
             reasons.append("湿度がかなり低い（25%以下）時間帯がありそうです。")
@@ -598,7 +572,7 @@ def build_daily_forecast_from_hourly(series: Dict[str, Any], days_ahead: int = 1
             score += 1
             reasons.append("湿度が高い（80%以上）時間帯がありそうです。")
 
-        # precipitation
+        # 降水合計
         if prec_sum >= 20:
             score += 2
             reasons.append("降水量が多め（合計20mm以上）になりそうです。")
@@ -606,7 +580,7 @@ def build_daily_forecast_from_hourly(series: Dict[str, Any], days_ahead: int = 1
             score += 1
             reasons.append("雨が降りそう（合計5mm以上）です。")
 
-        # wind
+        # 風
         if wind_max is not None:
             if wind_max >= 10:
                 score += 2
@@ -706,7 +680,7 @@ def call_gemini_for_advice(
 
 
 # ==================================================
-# UI: colorful & friendly
+# UI: CSS（表示が切れないように上余白を確保）
 # ==================================================
 def inject_css():
     css = """
@@ -718,12 +692,12 @@ def inject_css():
           radial-gradient(circle at 20% 90%, rgba(129, 199, 132, 0.28), transparent 45%),
           radial-gradient(circle at 90% 85%, rgba(79, 195, 247, 0.25), transparent 45%),
           #fbfbff;
-        overflow-x: hidden; /* 横はみ出しで切れるのも防止 */
+        overflow-x: hidden;
     }
-    html, body, [class*="css"] { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
     body { overflow-x: hidden; }
+    html, body, [class*="css"] { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
 
-    /* ✅ここが重要：上部バーに隠れないように上の余白を増やす */
+    /* ✅上部バーに隠れないよう余白を増やす（環境差も吸収） */
     .block-container {
         max-width: 980px;
         padding-top: calc(env(safe-area-inset-top) + 4.6rem);
@@ -731,8 +705,6 @@ def inject_css():
         padding-left: 1rem;
         padding-right: 1rem;
     }
-
-    /* スマホは上のバーが大きいことがあるので、さらに余白を増やす */
     @media (max-width: 640px) {
         .block-container {
             padding-top: calc(env(safe-area-inset-top) + 5.6rem);
@@ -757,8 +729,15 @@ def inject_css():
         box-shadow: 0 6px 18px rgba(0,0,0,0.05);
         margin-top: .6rem;
     }
-    .wf-section { font-size: 1.05rem; font-weight: 850; margin-top: 1rem; margin-bottom: .45rem;
-        display:flex; align-items:center; gap:.35rem; }
+    .wf-section {
+        font-size: 1.05rem;
+        font-weight: 850;
+        margin-top: 1rem;
+        margin-bottom: .45rem;
+        display:flex;
+        align-items:center;
+        gap:.35rem;
+    }
 
     .stButton>button {
         border-radius: 14px !important;
@@ -779,7 +758,6 @@ def inject_css():
     </style>
     """
     st.markdown(css, unsafe_allow_html=True)
-
 
 
 def risk_card(label: str, color: str, emoji: str, total_score: int, base_score: int, daily_score: int):
@@ -864,7 +842,7 @@ def build_simple_calendar_html(forecast_days: List[Dict[str, Any]]) -> str:
     first_date = forecast_days[0]["date"]
     year, month = first_date.year, first_date.month
 
-    cal = pycal.Calendar(firstweekday=6)  # Sunday start
+    cal = pycal.Calendar(firstweekday=6)
     weeks = cal.monthdayscalendar(year, month)
     week_labels = ["日", "月", "火", "水", "木", "金", "土"]
 
@@ -978,8 +956,13 @@ def main():
 
     if "profile" not in st.session_state:
         st.session_state.profile = load_profile()
+
     if "active_tab" not in st.session_state:
         st.session_state.active_tab = "today"
+
+    # ✅結果保持（消えないように）
+    if "wf_result" not in st.session_state:
+        st.session_state.wf_result = None
 
     profile = st.session_state.profile
 
@@ -988,7 +971,7 @@ def main():
     st.markdown('<div class="wf-sub">気圧だけじゃなく、気温・湿度・雨・風も使って「崩れやすさ」を見える化します。</div>', unsafe_allow_html=True)
     st.markdown("<div class='wf-card'>※このアプリは体調管理の目安です。強い症状があるときはスコアに関係なく医療機関の受診を検討してください。</div>", unsafe_allow_html=True)
 
-    # Tabs (simple)
+    # Tabs
     t1, t2 = st.columns(2)
     with t1:
         if st.button("🌈 きょうのようす", use_container_width=True):
@@ -1031,7 +1014,17 @@ def main():
 
     st.markdown("---")
 
-    if st.button("✨ きょうのリスク＋予報カレンダーを見る", use_container_width=True):
+    # ✅ボタン（結果が消えないようにセッションに保存）
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
+        run_clicked = st.button("✨ きょうのリスク＋予報カレンダーを見る", use_container_width=True, key="wf_run")
+    with btn_col2:
+        clear_clicked = st.button("🧹 結果をクリア", use_container_width=True, key="wf_clear")
+
+    if clear_clicked:
+        st.session_state.wf_result = None
+
+    if run_clicked:
         pressure_drop_3h = manual_pressure_drop
         latest_pressure = None
         bundle = None
@@ -1039,12 +1032,13 @@ def main():
         if use_auto_weather:
             with st.spinner("天気データを取得しています…"):
                 p_drop, latest_p, msg, bundle = fetch_weather_from_open_meteo(latitude, longitude)
-            st.info(msg)
+            api_msg = msg
             if p_drop is not None:
                 pressure_drop_3h = p_drop
             latest_pressure = latest_p
+        else:
+            api_msg = "API自動取得はOFFです（手動の気圧変化を使用）。"
 
-        # Base + daily (non-weather) score
         base_score, base_reasons = calc_profile_base_risk(profile)
         daily_score, daily_reasons = calc_daily_risk(
             sleep_hours=sleep_hours,
@@ -1054,7 +1048,6 @@ def main():
             steps=steps,
         )
 
-        # Add weather score from latest
         weather_snapshot = {}
         if bundle and bundle.get("hourly"):
             ws, wr, snap = add_weather_risk_from_latest(bundle["hourly"])
@@ -1065,61 +1058,16 @@ def main():
         total_score = base_score + daily_score
         label, color, emoji = classify_total_risk(total_score)
 
-        # Today result
-        st.markdown('<div class="wf-section">🧡 きょうの結果</div>', unsafe_allow_html=True)
-        risk_card(label, color, emoji, total_score, base_score, daily_score)
+        forecast_days = []
+        if bundle and bundle.get("hourly"):
+            forecast_days = build_daily_forecast_from_hourly(bundle["hourly"], days_ahead=days_ahead)
 
-        # Quick weather card
-        st.markdown("<div class='wf-card'>📌 いまの天気（参考）</div>", unsafe_allow_html=True)
-        cW1, cW2, cW3, cW4, cW5 = st.columns(5)
-        with cW1:
-            if latest_pressure is not None:
-                st.metric("気圧(hPa)", f"{latest_pressure:.1f}")
-            else:
-                st.metric("気圧(hPa)", "—")
-        with cW2:
-            t = weather_snapshot.get("temperature_2m")
-            st.metric("気温(℃)", f"{t:.1f}" if t is not None else "—")
-        with cW3:
-            a = weather_snapshot.get("apparent_temperature")
-            st.metric("体感(℃)", f"{a:.1f}" if a is not None else "—")
-        with cW4:
-            h = weather_snapshot.get("relative_humidity_2m")
-            st.metric("湿度(%)", f"{h:.0f}" if h is not None else "—")
-        with cW5:
-            w = weather_snapshot.get("wind_speed_10m")
-            st.metric("風速(m/s)", f"{w:.1f}" if w is not None else "—")
-
-        st.write(f"直近3時間の気圧変化（判定に使用）: {pressure_drop_3h:+.1f} hPa")
-
-        st.markdown('<div class="wf-section">🧩 理由（ざっくり）</div>', unsafe_allow_html=True)
-        st.markdown("<div class='wf-card'>", unsafe_allow_html=True)
-        st.write("ベース（プロフィール）:")
-        if base_reasons:
-            for r in base_reasons:
-                st.write(f"- {r}")
-        else:
-            st.write("- 目立つベース要因は少なめです。")
-
-        st.write("\nきょう（睡眠・気圧・天気など）:")
-        if daily_reasons:
-            for r in daily_reasons:
-                st.write(f"- {r}")
-        else:
-            st.write("- 目立つ追加要因は少なめです。")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        # Gemini advice
-        st.markdown('<div class="wf-section">🤖 AIのやさしいアドバイス</div>', unsafe_allow_html=True)
-        if client is None:
-            st.markdown(
-                "<div class='wf-card'>Geminiは未設定です（環境変数 GEMINI_API_KEY を設定すると有効になります）。</div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            profile_summary = summarize_profile_for_gemini(profile)
-            with st.spinner("アドバイスを作成中…"):
-                txt = call_gemini_for_advice(
+        # Gemini（毎回走らないよう保存して表示）
+        gemini_text = None
+        if client is not None:
+            with st.spinner("AIのやさしいアドバイスを作成中…"):
+                profile_summary = summarize_profile_for_gemini(profile)
+                gemini_text = call_gemini_for_advice(
                     profile_summary=profile_summary,
                     risk_label=label,
                     total_score=total_score,
@@ -1129,66 +1077,131 @@ def main():
                     daily_reasons=daily_reasons,
                     user_note=user_note,
                 )
-            st.markdown(f"<div class='wf-card'>{txt}</div>", unsafe_allow_html=True)
 
-        # Forecast calendar
+        # ✅ここに保存（これでrerunしても消えない）
+        st.session_state.wf_result = {
+            "api_msg": api_msg,
+            "latest_pressure": latest_pressure,
+            "pressure_drop_3h": pressure_drop_3h,
+            "base_score": base_score,
+            "base_reasons": base_reasons,
+            "daily_score": daily_score,
+            "daily_reasons": daily_reasons,
+            "total_score": total_score,
+            "label": label,
+            "color": color,
+            "emoji": emoji,
+            "weather_snapshot": weather_snapshot,
+            "forecast_days": forecast_days,
+            "gemini_text": gemini_text,
+        }
+
+    # ==================================================
+    # ✅結果表示（ボタンの外）→ ここが「消えない」本体
+    # ==================================================
+    res = st.session_state.wf_result
+    if res:
+        st.info(res["api_msg"])
+
+        st.markdown('<div class="wf-section">🧡 きょうの結果</div>', unsafe_allow_html=True)
+        risk_card(res["label"], res["color"], res["emoji"], res["total_score"], res["base_score"], res["daily_score"])
+
+        st.markdown("<div class='wf-card'>📌 いまの天気（参考）</div>", unsafe_allow_html=True)
+        cW1, cW2, cW3, cW4, cW5 = st.columns(5)
+        with cW1:
+            lp = res["latest_pressure"]
+            st.metric("気圧(hPa)", f"{lp:.1f}" if lp is not None else "—")
+        with cW2:
+            t = res["weather_snapshot"].get("temperature_2m")
+            st.metric("気温(℃)", f"{t:.1f}" if t is not None else "—")
+        with cW3:
+            a = res["weather_snapshot"].get("apparent_temperature")
+            st.metric("体感(℃)", f"{a:.1f}" if a is not None else "—")
+        with cW4:
+            h = res["weather_snapshot"].get("relative_humidity_2m")
+            st.metric("湿度(%)", f"{h:.0f}" if h is not None else "—")
+        with cW5:
+            w = res["weather_snapshot"].get("wind_speed_10m")
+            st.metric("風速(m/s)", f"{w:.1f}" if w is not None else "—")
+
+        st.write(f"直近3時間の気圧変化（判定に使用）: {res['pressure_drop_3h']:+.1f} hPa")
+
+        st.markdown('<div class="wf-section">🧩 理由（ざっくり）</div>', unsafe_allow_html=True)
+        st.markdown("<div class='wf-card'>", unsafe_allow_html=True)
+        st.write("ベース（プロフィール）:")
+        if res["base_reasons"]:
+            for r in res["base_reasons"]:
+                st.write(f"- {r}")
+        else:
+            st.write("- 目立つベース要因は少なめです。")
+
+        st.write("\nきょう（睡眠・気圧・天気など）:")
+        if res["daily_reasons"]:
+            for r in res["daily_reasons"]:
+                st.write(f"- {r}")
+        else:
+            st.write("- 目立つ追加要因は少なめです。")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown('<div class="wf-section">🤖 AIのやさしいアドバイス</div>', unsafe_allow_html=True)
+        if client is None:
+            st.markdown("<div class='wf-card'>Geminiは未設定です（環境変数 GEMINI_API_KEY を設定すると有効になります）。</div>", unsafe_allow_html=True)
+        else:
+            st.markdown(f"<div class='wf-card'>{res['gemini_text']}</div>", unsafe_allow_html=True)
+
         st.markdown('<div class="wf-section">🗓️ 予報カレンダー（気圧＋気温＋湿度＋雨＋風）</div>', unsafe_allow_html=True)
 
-        if not bundle or not bundle.get("hourly"):
-            st.markdown("<div class='wf-card'>天気データがないため、予報カレンダーは表示できません。</div>", unsafe_allow_html=True)
-            return
-
-        forecast_days = build_daily_forecast_from_hourly(bundle["hourly"], days_ahead=days_ahead)
+        forecast_days = res["forecast_days"]
         if not forecast_days:
-            st.markdown("<div class='wf-card'>予報を計算できませんでした。</div>", unsafe_allow_html=True)
-            return
-
-        events, index = forecast_to_events(forecast_days)
-
-        if CALENDAR_AVAILABLE:
-            st.markdown("<div class='wf-card'>📌 日付（色つき）をクリックすると、その日の根拠が下に出ます。</div>", unsafe_allow_html=True)
-
-            options = {
-                "initialView": "dayGridMonth",
-                "locale": "ja",
-                "height": 780,  # big
-                "headerToolbar": {"left": "prev,next today", "center": "title", "right": "dayGridMonth,listWeek"},
-                "dayMaxEventRows": True,
-            }
-            cal_state = st_calendar(events=events, options=options, key="wf_calendar")
-
-            selected = None
-            if isinstance(cal_state, dict):
-                selected = cal_state.get("eventClick") or cal_state.get("event")
-
-            if selected and isinstance(selected, dict):
-                start = selected.get("start", "")
-                date_str = start[:10] if start else ""
-                info = index.get(date_str)
-                if info:
-                    st.markdown("<div class='wf-card'>", unsafe_allow_html=True)
-                    st.write(f"📅 {date_str} の予報：**{info['label']}**（スコア: {info['score']}）")
-                    st.write(f"・最低気圧: {info['min_pressure']:.1f} hPa / 3時間最大変化: {info['max_drop_3h']:+.1f} hPa")
-                    if info.get("min_temp") is not None and info.get("max_temp") is not None:
-                        st.write(f"・気温: {info['min_temp']:.1f}〜{info['max_temp']:.1f} ℃")
-                    if info.get("min_feels") is not None and info.get("max_feels") is not None:
-                        st.write(f"・体感: {info['min_feels']:.1f}〜{info['max_feels']:.1f} ℃")
-                    if info.get("min_rh") is not None and info.get("max_rh") is not None:
-                        st.write(f"・湿度: {info['min_rh']:.0f}〜{info['max_rh']:.0f} %")
-                    st.write(f"・降水合計: {info.get('prec_sum', 0.0):.1f} mm")
-                    if info.get("wind_max") is not None:
-                        st.write(f"・最大風速: {info['wind_max']:.1f} m/s")
-                    if info.get("reasons"):
-                        st.write("理由：")
-                        for r in info["reasons"]:
-                            st.write(f"- {r}")
-                    st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown("<div class='wf-card'>予報を計算できませんでした（API自動取得OFFの場合もここになります）。</div>", unsafe_allow_html=True)
         else:
-            st.markdown(
-                "<div class='wf-card'>本物のカレンダー表示を使うには <code>pip install streamlit-calendar</code> を実行してください。いまは簡易表示です。</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(build_simple_calendar_html(forecast_days), unsafe_allow_html=True)
+            events, index = forecast_to_events(forecast_days)
+
+            if CALENDAR_AVAILABLE:
+                st.markdown("<div class='wf-card'>📌 日付（色つき）をクリックすると、その日の根拠が下に出ます。</div>", unsafe_allow_html=True)
+
+                options = {
+                    "initialView": "dayGridMonth",
+                    "locale": "ja",
+                    "height": 780,
+                    "headerToolbar": {"left": "prev,next today", "center": "title", "right": "dayGridMonth,listWeek"},
+                    "dayMaxEventRows": True,
+                }
+                cal_state = st_calendar(events=events, options=options, key="wf_calendar")
+
+                # streamlit-calendarの戻り値差異に備えて複数キーを見る
+                selected = None
+                if isinstance(cal_state, dict):
+                    selected = cal_state.get("eventClick") or cal_state.get("event")
+
+                if selected and isinstance(selected, dict):
+                    start = selected.get("start", "")
+                    date_str = start[:10] if start else ""
+                    info = index.get(date_str)
+                    if info:
+                        st.markdown("<div class='wf-card'>", unsafe_allow_html=True)
+                        st.write(f"📅 {date_str} の予報：**{info['label']}**（スコア: {info['score']}）")
+                        st.write(f"・最低気圧: {info['min_pressure']:.1f} hPa / 3時間最大変化: {info['max_drop_3h']:+.1f} hPa")
+                        if info.get("min_temp") is not None and info.get("max_temp") is not None:
+                            st.write(f"・気温: {info['min_temp']:.1f}〜{info['max_temp']:.1f} ℃")
+                        if info.get("min_feels") is not None and info.get("max_feels") is not None:
+                            st.write(f"・体感: {info['min_feels']:.1f}〜{info['max_feels']:.1f} ℃")
+                        if info.get("min_rh") is not None and info.get("max_rh") is not None:
+                            st.write(f"・湿度: {info['min_rh']:.0f}〜{info['max_rh']:.0f} %")
+                        st.write(f"・降水合計: {info.get('prec_sum', 0.0):.1f} mm")
+                        if info.get("wind_max") is not None:
+                            st.write(f"・最大風速: {info['wind_max']:.1f} m/s")
+                        if info.get("reasons"):
+                            st.write("理由：")
+                            for r in info["reasons"]:
+                                st.write(f"- {r}")
+                        st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    "<div class='wf-card'>本物のカレンダーを使うには <code>pip install streamlit-calendar</code> を実行してください。いまは簡易表示です。</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(build_simple_calendar_html(forecast_days), unsafe_allow_html=True)
 
         st.markdown(
             "<div class='wf-card'>"
