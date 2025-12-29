@@ -3,11 +3,11 @@ import json
 import datetime as dt
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
-import calendar as pycal
-import html  # ✅ 追加：Gemini出力のHTML崩れ対策
+import html
 
 import requests
 import streamlit as st
+
 
 # ==================================================
 # Optional: Gemini
@@ -19,16 +19,6 @@ try:
     GEMINI_AVAILABLE = True
 except Exception:
     GEMINI_AVAILABLE = False
-
-# ==================================================
-# Optional: FullCalendar for Streamlit
-# ==================================================
-CALENDAR_AVAILABLE = False
-try:
-    from streamlit_calendar import calendar as st_calendar
-    CALENDAR_AVAILABLE = True
-except Exception:
-    CALENDAR_AVAILABLE = False
 
 
 # ==================================================
@@ -53,10 +43,18 @@ if GEMINI_AVAILABLE and GEMINI_API_KEY:
 # Utilities
 # ==================================================
 def safe_html_text(text: Optional[str]) -> str:
-    """✅ Gemini出力などをHTML崩れさせず表示するためのエスケープ"""
     if not text:
         return ""
     return html.escape(text).replace("\n", "<br>")
+
+
+def fmt_opt(x: Optional[float], fmt: str) -> str:
+    if x is None:
+        return "—"
+    try:
+        return format(float(x), fmt)
+    except Exception:
+        return "—"
 
 
 # ==================================================
@@ -433,7 +431,7 @@ def classify_total_risk(total_score: int) -> Tuple[str, str, str]:
 
 
 # ==================================================
-# Forecast
+# Forecast (daily from hourly)
 # ==================================================
 def _parse_iso(ts: str) -> Optional[datetime]:
     try:
@@ -471,9 +469,6 @@ def build_daily_forecast_from_hourly(series: Dict[str, Any], days_ahead: int = 1
     out: List[Dict[str, Any]] = []
     for d in dates:
         idxs = idx_by_date[d]
-        if not idxs:
-            continue
-
         pressures = [get_f("pressure_msl", i) for i in idxs]
         pressures = [p for p in pressures if p is not None]
         if not pressures:
@@ -577,10 +572,10 @@ def build_daily_forecast_from_hourly(series: Dict[str, Any], days_ahead: int = 1
 
         out.append(
             {
-                "date": d,
+                "date": d,  # dt.date
                 "label": label,
-                "score": score,
-                "min_pressure": min_pressure,
+                "score": int(score),
+                "min_pressure": float(min_pressure),
                 "max_drop_3h": float(max_drop_3h),
                 "min_temp": min_temp,
                 "max_temp": max_temp,
@@ -659,7 +654,7 @@ def call_gemini_for_advice(
 
 
 # ==================================================
-# UI: CSS（上部が切れない）
+# UI: CSS
 # ==================================================
 def inject_css():
     css = """
@@ -716,6 +711,15 @@ def inject_css():
         align-items:center;
         gap:.35rem;
     }
+    .wf-badge {
+        display:inline-block;
+        padding: .18rem .55rem;
+        border-radius: 999px;
+        font-weight: 900;
+        border: 1px solid rgba(0,0,0,0.08);
+        background: rgba(255,255,255,0.65);
+        margin-right: .35rem;
+    }
 
     .stButton>button {
         border-radius: 14px !important;
@@ -723,15 +727,6 @@ def inject_css():
         font-weight: 800 !important;
         border: 1px solid rgba(0,0,0,0.08) !important;
         box-shadow: 0 6px 16px rgba(0,0,0,0.05) !important;
-    }
-
-    .fc { font-size: 1.05rem; }
-    .fc .fc-toolbar-title { font-size: 1.25rem; font-weight: 900; }
-    .fc .fc-daygrid-day-number { font-weight: 900; }
-    .fc .fc-daygrid-day-frame { min-height: 92px; }
-    @media (max-width: 640px) {
-        .fc { font-size: 0.95rem; }
-        .fc .fc-daygrid-day-frame { min-height: 78px; }
     }
     </style>
     """
@@ -756,90 +751,43 @@ def risk_card(label: str, color: str, emoji: str, total_score: int, base_score: 
     )
 
 
-# ==================================================
-# Calendar helpers
-# ==================================================
-def forecast_to_events(forecast_days: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-    events: List[Dict[str, Any]] = []
-    index: Dict[str, Dict[str, Any]] = {}
+def forecast_label_style(label: str) -> Tuple[str, str]:
+    if label == "低め":
+        return "🟢 低め", "#B7F0C1"
+    if label == "やや高め":
+        return "🟡 やや高め", "#FFF2B2"
+    return "🔴 高め", "#FFD1D9"
 
-    for d in forecast_days:
+
+def render_forecast_cards(forecast_days: List[Dict[str, Any]]):
+    st.markdown('<div class="wf-section">🗓️ 予報（カレンダー停止：カード一覧）</div>', unsafe_allow_html=True)
+    st.markdown("<div class='wf-card'>日付ごとの「崩れやすさ」をカードで表示します。タップで理由が見られます。</div>", unsafe_allow_html=True)
+
+    # 3列グリッド（スマホは自動で縦に落ちる）
+    cols = st.columns(3)
+    for i, d in enumerate(forecast_days):
         date_obj: dt.date = d["date"]
-        date_str = date_obj.isoformat()
-        label = d["label"]
-
-        if label == "低め":
-            title = "🟢 低め"
-            bg = "#B7F0C1"
-            border = "#57C46A"
-        elif label == "やや高め":
-            title = "🟡 やや高め"
-            bg = "#FFF2B2"
-            border = "#F4C44E"
-        else:
-            title = "🔴 高め"
-            bg = "#FFD1D9"
-            border = "#FF6B6B"
-
-        events.append(
-            {
-                "title": title,
-                "start": date_str,
-                "end": date_str,
-                "allDay": True,
-                "backgroundColor": bg,
-                "borderColor": border,
-                "textColor": "#1f1f1f",
-                "extendedProps": d,
-            }
-        )
-        index[date_str] = d
-
-    return events, index
-
-
-def build_simple_calendar_html(forecast_days: List[Dict[str, Any]]) -> str:
-    if not forecast_days:
-        return "<div class='wf-card'>予報データがありません。</div>"
-
-    by_date = {d["date"]: d for d in forecast_days}
-    first_date = forecast_days[0]["date"]
-    year, month = first_date.year, first_date.month
-
-    cal = pycal.Calendar(firstweekday=6)
-    weeks = cal.monthdayscalendar(year, month)
-    week_labels = ["日", "月", "火", "水", "木", "金", "土"]
-
-    html_s = f"<div class='wf-card'><div style='font-weight:900;margin-bottom:.4rem'>{year}年{month}月（簡易表示）</div>"
-    html_s += "<table style='width:100%;border-collapse:collapse;table-layout:fixed;border-radius:14px;overflow:hidden;'>"
-    html_s += "<tr>"
-    for w in week_labels:
-        html_s += f"<th style='background:#E1BEE7;padding:.45rem;font-size:.92rem'>{w}</th>"
-    html_s += "</tr>"
-
-    for week in weeks:
-        html_s += "<tr>"
-        for day in week:
-            if day == 0:
-                html_s += "<td style='background:rgba(0,0,0,0.03);height:80px'></td>"
-                continue
-            cur = dt.date(year, month, day)
-            info = by_date.get(cur)
-            if not info:
-                html_s += f"<td style='background:rgba(0,0,0,0.04);height:80px;padding:.25rem;vertical-align:top'><b>{day}</b><div style='opacity:.6'>—</div></td>"
-            else:
-                label = info["label"]
-                if label == "低め":
-                    bg, em = "#B7F0C1", "🟢"
-                elif label == "やや高め":
-                    bg, em = "#FFF2B2", "🟡"
-                else:
-                    bg, em = "#FFD1D9", "🔴"
-                html_s += f"<td style='background:{bg};height:80px;padding:.25rem;vertical-align:top'><b>{day}</b><div style='font-weight:800'>{em} {label}</div></td>"
-        html_s += "</tr>"
-
-    html_s += "</table></div>"
-    return html_s
+        date_str = date_obj.strftime("%m/%d (%a)")
+        title, bg = forecast_label_style(d["label"])
+        col = cols[i % 3]
+        with col:
+            with st.expander(f"{date_str}  {title}  （スコア {d['score']}）", expanded=False):
+                st.markdown(
+                    f"<div class='wf-card' style='background:{bg};border-color:rgba(0,0,0,0.06)'>"
+                    f"<span class='wf-badge'>最低気圧</span>{fmt_opt(d.get('min_pressure'), '.1f')} hPa<br>"
+                    f"<span class='wf-badge'>気圧変化(3h)</span>{fmt_opt(d.get('max_drop_3h'), '+.1f')} hPa<br>"
+                    f"<span class='wf-badge'>気温</span>{fmt_opt(d.get('min_temp'), '.1f')}〜{fmt_opt(d.get('max_temp'), '.1f')} ℃<br>"
+                    f"<span class='wf-badge'>体感</span>{fmt_opt(d.get('min_feels'), '.1f')}〜{fmt_opt(d.get('max_feels'), '.1f')} ℃<br>"
+                    f"<span class='wf-badge'>湿度</span>{fmt_opt(d.get('min_rh'), '.0f')}〜{fmt_opt(d.get('max_rh'), '.0f')} %<br>"
+                    f"<span class='wf-badge'>雨（合計）</span>{fmt_opt(d.get('prec_sum'), '.1f')} mm<br>"
+                    f"<span class='wf-badge'>風（最大）</span>{fmt_opt(d.get('wind_max'), '.1f')} m/s"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                if d.get("reasons"):
+                    st.write("理由：")
+                    for r in d["reasons"]:
+                        st.write(f"- {r}")
 
 
 # ==================================================
@@ -928,7 +876,7 @@ def main():
     profile = st.session_state.profile
 
     st.markdown(f'<div class="wf-title">🩺 {APP_TITLE}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="wf-sub">気圧だけじゃなく、気温・湿度・雨・風も使って「崩れやすさ」を見える化します。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="wf-sub">気圧＋気温＋湿度＋雨＋風で「崩れやすさ」を見える化します。</div>', unsafe_allow_html=True)
     st.markdown("<div class='wf-card'>※このアプリは体調管理の目安です。強い症状があるときはスコアに関係なく医療機関の受診を検討してください。</div>", unsafe_allow_html=True)
 
     t1, t2 = st.columns(2)
@@ -943,7 +891,6 @@ def main():
         st.session_state.profile = profile_tab_ui(profile)
         return
 
-    # ✅ ここから入力はフォーム（再実行のチラつきを抑える）
     st.markdown('<div class="wf-section">🌤️ きょうの入力</div>', unsafe_allow_html=True)
 
     with st.form("wf_form", clear_on_submit=False):
@@ -972,9 +919,8 @@ def main():
         st.markdown("<div class='wf-card'>🗓️ 予報の表示日数</div>", unsafe_allow_html=True)
         days_ahead = st.slider("何日先まで表示する？", min_value=3, max_value=14, value=7, step=1, key="days")
 
-        run_clicked = st.form_submit_button("✨ きょうのリスク＋予報カレンダーを見る", use_container_width=True)
+        run_clicked = st.form_submit_button("✨ きょうのリスク＋予報を見る", use_container_width=True)
 
-    # クリアはフォーム外（いつでも）
     if st.button("🧹 結果をクリア", use_container_width=True):
         st.session_state.wf_result = None
 
@@ -1012,7 +958,7 @@ def main():
         total_score = base_score + daily_score
         label, color, emoji = classify_total_risk(total_score)
 
-        forecast_days = []
+        forecast_days: List[Dict[str, Any]] = []
         if bundle and bundle.get("hourly"):
             forecast_days = build_daily_forecast_from_hourly(bundle["hourly"], days_ahead=days_ahead)
 
@@ -1049,7 +995,7 @@ def main():
         }
 
     # ==================================================
-    # 結果表示（常にsession_stateから描画）
+    # Results
     # ==================================================
     res = st.session_state.wf_result
     if res:
@@ -1099,49 +1045,13 @@ def main():
         if client is None:
             st.markdown("<div class='wf-card'>Geminiは未設定です（環境変数 GEMINI_API_KEY を設定すると有効になります）。</div>", unsafe_allow_html=True)
         else:
-            # ✅ ここが本命修正：HTMLエスケープして崩れないようにする
             st.markdown(f"<div class='wf-card'>{safe_html_text(res.get('gemini_text'))}</div>", unsafe_allow_html=True)
 
-        st.markdown('<div class="wf-section">🗓️ 予報カレンダー（気圧＋気温＋湿度＋雨＋風）</div>', unsafe_allow_html=True)
-
-        forecast_days = res["forecast_days"]
-        if not forecast_days:
-            st.markdown("<div class='wf-card'>予報を計算できませんでした（API自動取得OFFの場合もここになります）。</div>", unsafe_allow_html=True)
+        # ✅ カレンダーは完全に停止：カード一覧で予報表示
+        if res.get("forecast_days"):
+            render_forecast_cards(res["forecast_days"])
         else:
-            events, index = forecast_to_events(forecast_days)
-
-            if CALENDAR_AVAILABLE:
-                st.markdown("<div class='wf-card'>📌 日付（色つき）をクリックすると、その日の根拠が下に出ます。</div>", unsafe_allow_html=True)
-                options = {
-                    "initialView": "dayGridMonth",
-                    "locale": "ja",
-                    "height": 780,
-                    "headerToolbar": {"left": "prev,next today", "center": "title", "right": "dayGridMonth,listWeek"},
-                    "dayMaxEventRows": True,
-                }
-                cal_state = st_calendar(events=events, options=options, key="wf_calendar")
-                selected = None
-                if isinstance(cal_state, dict):
-                    selected = cal_state.get("eventClick") or cal_state.get("event")
-
-                if selected and isinstance(selected, dict):
-                    start = selected.get("start", "")
-                    date_str = start[:10] if start else ""
-                    info = index.get(date_str)
-                    if info:
-                        st.markdown("<div class='wf-card'>", unsafe_allow_html=True)
-                        st.write(f"📅 {date_str} の予報：**{info['label']}**（スコア: {info['score']}）")
-                        if info.get("reasons"):
-                            st.write("理由：")
-                            for r in info["reasons"]:
-                                st.write(f"- {r}")
-                        st.markdown("</div>", unsafe_allow_html=True)
-            else:
-                st.markdown(
-                    "<div class='wf-card'>本物のカレンダーを使うには <code>pip install streamlit-calendar</code> を実行してください。いまは簡易表示です。</div>",
-                    unsafe_allow_html=True,
-                )
-                st.markdown(build_simple_calendar_html(forecast_days), unsafe_allow_html=True)
+            st.markdown("<div class='wf-card'>予報を計算できませんでした（API自動取得OFFの場合もここになります）。</div>", unsafe_allow_html=True)
 
         st.markdown(
             "<div class='wf-card'>"
