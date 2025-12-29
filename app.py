@@ -1,0 +1,846 @@
+import os
+import json
+import datetime as dt
+from datetime import datetime
+from typing import Dict, Any, List, Optional
+
+import requests
+import streamlit as st
+
+from google import genai
+from google.genai import types
+
+# =========================
+# 設定
+# =========================
+
+# プロファイル保存先
+PROFILE_PATH = "profile.json"
+
+# Gemini APIキー（Google AI Studio で取得）
+# Windows: setx GEMINI_API_KEY "YOUR_KEY"
+# Mac/Linux: export GEMINI_API_KEY="YOUR_KEY"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+client = None
+if GEMINI_API_KEY:
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception:
+        client = None  # 失敗したら Gemini なしモード
+
+# Open-Meteo 用 デフォルト座標（瀬戸内・愛媛あたりの仮値）
+DEFAULT_LAT = 34.25
+DEFAULT_LON = 133.20
+
+
+# =========================
+# プロファイル読み書き
+# =========================
+
+def default_profile() -> Dict[str, Any]:
+    return {
+        "age": None,
+        "sex": "未設定",
+        "height_cm": None,
+        "weight_kg": None,
+        "blood_type": "",
+        "chronic": {
+            "migraine": False,
+            "tension_headache": False,
+            "asthma": False,
+            "copd": False,
+            "hypertension": False,
+            "diabetes": False,
+            "cvd": False,  # 心疾患
+            "anxiety_depression": False,
+        },
+        "allergy": {
+            "nsaids": False,
+            "antibiotics": False,
+            "food": "",
+            "others": "",
+        },
+    }
+
+
+def load_profile() -> Dict[str, Any]:
+    if os.path.exists(PROFILE_PATH):
+        try:
+            with open(PROFILE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # 足りないキーを補完
+            base = default_profile()
+            base.update(data)
+            # ネストも補完
+            for k, v in default_profile()["chronic"].items():
+                base["chronic"].setdefault(k, v)
+            for k, v in default_profile()["allergy"].items():
+                base["allergy"].setdefault(k, v)
+            return base
+        except Exception:
+            return default_profile()
+    else:
+        return default_profile()
+
+
+def save_profile(profile: Dict[str, Any]) -> None:
+    try:
+        with open(PROFILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(profile, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# =========================
+# BMI & ベースリスク計算
+# =========================
+
+def calc_bmi(height_cm: Optional[float], weight_kg: Optional[float]) -> Optional[float]:
+    if not height_cm or not weight_kg or height_cm <= 0:
+        return None
+    h_m = height_cm / 100.0
+    return weight_kg / (h_m * h_m)
+
+
+def calc_profile_base_risk(profile: Dict[str, Any]) -> (int, List[str]):
+    """
+    プロファイルからベースリスクスコアと理由リストを計算
+    ※ 診断ではなく「崩れやすさのベースライン」のイメージ
+    """
+    score = 0
+    reasons: List[str] = []
+
+    age = profile.get("age")
+    if age is not None:
+        if age >= 60:
+            score += 2
+            reasons.append("60歳以上で、体調が崩れやすい年齢帯です。")
+        elif age >= 40:
+            score += 1
+            reasons.append("40歳代以降で、回復力がやや落ちやすい時期です。")
+
+    bmi = calc_bmi(profile.get("height_cm"), profile.get("weight_kg"))
+    if bmi is not None:
+        if bmi < 18.5:
+            score += 1
+            reasons.append("やせ気味（BMI<18.5）で、疲れやすさや冷えが出やすい体質です。")
+        elif 25 <= bmi < 30:
+            score += 1
+            reasons.append("軽度の肥満傾向（BMI≥25）で、関節や心肺への負荷がやや高い状態です。")
+        elif bmi >= 30:
+            score += 2
+            reasons.append("肥満（BMI≥30）で、心肺・関節への負荷が高い状態です。")
+
+    chronic = profile.get("chronic", {})
+
+    if chronic.get("migraine"):
+        score += 1
+        reasons.append("片頭痛があり、気圧変化や睡眠不足の影響を受けやすい背景があります。")
+
+    if chronic.get("asthma") or chronic.get("copd"):
+        score += 1
+        reasons.append("呼吸器の持病があり、寒さや感染症の影響を受けやすい状態です。")
+
+    if chronic.get("hypertension") or chronic.get("cvd"):
+        score += 1
+        reasons.append("血圧や心臓の負担が高まりやすい背景があります。")
+
+    if chronic.get("diabetes"):
+        score += 1
+        reasons.append("糖代謝の負担があり、体調変動の影響を受けやすい可能性があります。")
+
+    if chronic.get("anxiety_depression"):
+        score += 1
+        reasons.append("メンタル面の負荷が背景にあり、睡眠やストレスの影響を受けやすい状態です。")
+
+    # ベーススコアの上限を決めておく（例：3）
+    if score > 3:
+        score = 3
+
+    return score, reasons
+
+
+def summarize_profile_for_gemini(profile: Dict[str, Any]) -> str:
+    """
+    Geminiに渡す用の、個人情報を少しぼかしたプロフィール要約。
+    """
+    parts = []
+
+    age = profile.get("age")
+    if age is not None:
+        if age < 30:
+            parts.append("20〜30代前半")
+        elif age < 40:
+            parts.append("30代後半")
+        elif age < 50:
+            parts.append("40代")
+        elif age < 60:
+            parts.append("50代")
+        else:
+            parts.append("60代以上")
+    else:
+        parts.append("年齢は不明")
+
+    bmi = calc_bmi(profile.get("height_cm"), profile.get("weight_kg"))
+    if bmi is not None:
+        if bmi < 18.5:
+            parts.append("やせ気味")
+        elif bmi >= 30:
+            parts.append("肥満傾向")
+        elif bmi >= 25:
+            parts.append("やや肥満気味")
+        else:
+            parts.append("標準体型に近い")
+
+    chronic = profile.get("chronic", {})
+    chronic_tags = []
+    if chronic.get("migraine"):
+        chronic_tags.append("片頭痛持ち")
+    if chronic.get("asthma") or chronic.get("copd"):
+        chronic_tags.append("呼吸器の持病あり")
+    if chronic.get("hypertension") or chronic.get("cvd"):
+        chronic_tags.append("血圧・心臓のリスクあり")
+    if chronic.get("diabetes"):
+        chronic_tags.append("糖代謝の負担あり")
+    if chronic.get("anxiety_depression"):
+        chronic_tags.append("メンタル面の負荷あり")
+
+    if chronic_tags:
+        parts.append("慢性疾患として " + "・".join(chronic_tags) + " がある")
+    else:
+        parts.append("特に大きな慢性疾患は登録されていない")
+
+    allergy = profile.get("allergy", {})
+    if allergy.get("nsaids"):
+        parts.append("一部の痛み止め（NSAIDs）にアレルギーの可能性あり")
+
+    return " / ".join(parts)
+
+
+# =========================
+# Open-Meteo から気圧取得
+# =========================
+
+def fetch_pressure_from_open_meteo(latitude: float, longitude: float):
+    """
+    Open-Meteoから hourly pressure_msl を取得して、
+    「現在の気圧」「直近3時間の気圧変化」「全時間配列」を返す。
+
+    戻り値:
+        (pressure_drop, latest_pressure, message, times, pressures)
+
+        pressure_drop: float or None（latest - 3時間前）
+        latest_pressure: float or None
+        message: str
+        times: list[str] or None（ISO文字列）
+        pressures: list[float] or None
+    """
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "hourly": "pressure_msl",
+        "timezone": "auto",
+    }
+
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        hourly = data.get("hourly", {})
+        times = hourly.get("time", [])
+        pressures = hourly.get("pressure_msl", [])
+
+        if not times or not pressures:
+            return (
+                None,
+                None,
+                "気圧データが取得できませんでした（hourly.pressure_msl が空）。",
+                None,
+                None,
+            )
+
+        latest = float(pressures[-1])
+
+        if len(pressures) < 4:
+            msg = (
+                "気圧データは取得できましたが、3時間分の履歴が足りません。"
+                f"\n・現在の気圧: {latest:.1f} hPa"
+            )
+            return None, latest, msg, times, pressures
+
+        prev3 = float(pressures[-4])
+        pressure_drop = latest - prev3  # マイナスなら低下
+
+        msg = (
+            "Open-Meteoから気圧を取得しました。\n"
+            f"・現在の気圧: {latest:.1f} hPa\n"
+            f"・約3時間前との差: {pressure_drop:+.1f} hPa"
+        )
+        return pressure_drop, latest, msg, times, pressures
+
+    except Exception as e:
+        return None, None, f"Open-Meteoからの気圧取得に失敗しました: {e}", None, None
+
+
+# =========================
+# 日別の気圧リスク解析
+# =========================
+
+def classify_pressure_risk(max_drop_3h: float, min_pressure: float):
+    """
+    1日の中での「最大3時間気圧低下量」「最低気圧」から
+    リスクラベルと理由を返す。
+    """
+    score = 0
+    reasons: List[str] = []
+
+    # 3時間あたりの気圧低下
+    if max_drop_3h <= -6.0:
+        score += 2
+        reasons.append("3時間で6hPa以上の急激な気圧低下が予想されます。")
+    elif max_drop_3h <= -3.0:
+        score += 1
+        reasons.append("3時間で3〜6hPa程度の気圧低下が予想されます。")
+
+    # 絶対的な気圧の低さ
+    if min_pressure < 1000.0:
+        score += 2
+        reasons.append("一日の中で気圧が1000hPaを下回る時間帯があります。")
+    elif min_pressure < 1005.0:
+        score += 1
+        reasons.append("一日の中で気圧が1005hPaを下回る時間帯があります。")
+
+    if score <= 1:
+        label = "低"
+    elif score <= 3:
+        label = "中"
+    else:
+        label = "高"
+
+    return label, score, reasons
+
+
+def make_pressure_forecast(times, pressures, days_ahead: int = 5):
+    """
+    Open-Meteoのhourly time/pressure配列から、
+    今日〜数日先までの日別の気圧リスクを計算する。
+
+    戻り値: list[dict]
+        {
+          "date": dt.date,
+          "label": "低/中/高",
+          "score": int,
+          "max_drop_3h": float,
+          "min_pressure": float,
+          "reasons": [str, ...]
+        }
+    """
+    if not times or not pressures:
+        return []
+
+    by_date: Dict[dt.date, List[float]] = {}
+    for t_str, p in zip(times, pressures):
+        try:
+            dt_obj = datetime.fromisoformat(t_str)
+        except Exception:
+            continue
+        d = dt_obj.date()
+        by_date.setdefault(d, []).append(float(p))
+
+    today = dt.date.today()
+    target_dates = sorted(d for d in by_date.keys() if d >= today)
+    target_dates = target_dates[:days_ahead]
+
+    results = []
+
+    for d in target_dates:
+        day_pressures = by_date[d]
+        if len(day_pressures) < 4:
+            min_p = min(day_pressures)
+            max_drop_3h = 0.0
+        else:
+            min_p = min(day_pressures)
+            max_drop_3h = 0.0
+            for i in range(3, len(day_pressures)):
+                drop = day_pressures[i] - day_pressures[i - 3]
+                if drop < max_drop_3h:
+                    max_drop_3h = drop
+
+        label, score, reasons = classify_pressure_risk(max_drop_3h, min_p)
+
+        results.append(
+            {
+                "date": d,
+                "label": label,
+                "score": score,
+                "max_drop_3h": max_drop_3h,
+                "min_pressure": min_p,
+                "reasons": reasons,
+            }
+        )
+
+    return results
+
+
+# =========================
+# 今日のリスク計算（状態＋気圧）
+# =========================
+
+def calc_daily_risk(
+    sleep_hours: float,
+    alcohol: bool,
+    pressure_drop: Optional[float],
+    resting_hr_diff: float,
+    steps: Optional[int],
+) -> (int, List[str]):
+    """
+    「今日の条件」による追加リスクスコアと理由リスト
+    """
+    score = 0
+    reasons: List[str] = []
+
+    # 気圧変化
+    if pressure_drop is not None:
+        if pressure_drop <= -4:
+            score += 2
+            reasons.append("直近3時間で4hPa以上の急激な気圧低下があります。")
+        elif pressure_drop <= -2:
+            score += 1
+            reasons.append("直近3時間で2〜4hPa程度の気圧低下があります。")
+
+    # 睡眠
+    if sleep_hours < 5.5:
+        score += 2
+        reasons.append("睡眠時間が5.5時間未満で、強い睡眠不足気味です。")
+    elif sleep_hours < 6.5:
+        score += 1
+        reasons.append("睡眠時間が6.5時間未満で、やや睡眠不足気味です。")
+
+    # アルコール
+    if alcohol:
+        score += 1
+        reasons.append("前日にアルコールを飲んでおり、体への負担が残っている可能性があります。")
+
+    # 安静時心拍
+    if resting_hr_diff >= 8:
+        score += 2
+        reasons.append("安静時心拍が平常より8bpm以上高く、疲労や体調負荷が強い可能性があります。")
+    elif resting_hr_diff >= 4:
+        score += 1
+        reasons.append("安静時心拍がやや高めで、疲労やストレス負荷がある可能性があります。")
+
+    # 歩数
+    if steps is not None:
+        if steps < 2000:
+            score += 1
+            reasons.append("前日の活動量が少なく、血行不良やだるさが出やすい状態です。")
+        elif steps > 15000:
+            score += 1
+            reasons.append("前日の活動量がかなり多く、疲労が残っている可能性があります。")
+
+    return score, reasons
+
+
+def classify_total_risk(total_score: int) -> (str, str, str):
+    """
+    総合スコアから、ラベル・カラー・絵文字を返す
+    """
+    if total_score <= 2:
+        return "低", "#2e7d32", "🟢"
+    elif total_score <= 5:
+        return "中", "#f9a825", "🟡"
+    else:
+        return "高", "#c62828", "🔴"
+
+
+# =========================
+# Gemini でアドバイス生成
+# =========================
+
+def call_gemini_for_advice(
+    profile_summary: str,
+    risk_label: str,
+    total_score: int,
+    base_score: int,
+    daily_score: int,
+    base_reasons: List[str],
+    daily_reasons: List[str],
+    sleep_hours: float,
+    alcohol: bool,
+    pressure_drop: Optional[float],
+    resting_hr_diff: float,
+    steps: Optional[int],
+    user_note: str,
+) -> Optional[str]:
+    """
+    Gemini に体調と条件を渡して、1日の過ごし方アドバイスを生成。
+    """
+    if client is None:
+        return None
+
+    base_text = "\n  ".join(f"- {r}" for r in base_reasons) if base_reasons else "特になし"
+    daily_text = "\n  ".join(f"- {r}" for r in daily_reasons) if daily_reasons else "特になし"
+
+    prompt = f"""
+あなたは日本人の成人に対して、医学的常識に沿った一般的な養生アドバイスを行う専門家です。
+診断や治療の指示は行わず、日常生活の工夫と、必要な場合の受診目安のみを伝えてください。
+
+【この人の背景（プロフィール）】
+{profile_summary}
+
+【今日の総合リスク】
+- レベル: {risk_label}
+- トータルスコア: {total_score}（ベース {base_score} + 今日の条件 {daily_score}）
+
+【ベースリスクの理由（長期的要因）】
+  {base_text}
+
+【今日の条件によるリスク要因】
+  {daily_text}
+
+【今日の入力データ】
+- 睡眠時間: {sleep_hours} 時間
+- 前日のアルコール: {"あり" if alcohol else "なし"}
+- 直近3時間の気圧変化: {pressure_drop if pressure_drop is not None else "不明"} hPa
+- 安静時心拍の平常値との差: {resting_hr_diff} bpm
+- 前日の歩数（おおよそ）: {steps if steps is not None else "不明"}
+- 本人メモ・症状・予定:
+  {user_note if user_note else "特になし"}
+
+【出力条件】
+- 日本語・ですます調。
+- 800字以内。
+- 構成：
+  1. 今日のからだの状態の解釈（3〜5行）
+  2. 今日おすすめの過ごし方（箇条書き3〜5個）
+  3. 注意した方がいいサイン（受診を考える目安）（2〜4個）
+- 市販薬や具体的な薬剤名の指示はしないでください。
+- 緊急性が高い症状が疑われる場合は「早めに医療機関を受診することを検討してください」と書いてください。
+""".strip()
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.4,
+            ),
+        )
+        return response.text
+    except Exception as e:
+        return f"Geminiからの詳細アドバイス取得に失敗しました。\nエラーの概要: {e}"
+
+
+# =========================
+# UI 用ヘルパー
+# =========================
+
+def risk_card(label: str, color: str, emoji: str, total_score: int, base_score: int, daily_score: int):
+    """
+    総合リスク表示カード（色付き）
+    """
+    html = f"""
+    <div style="
+        border-radius: 16px;
+        padding: 16px 20px;
+        background-color: {color}20;
+        border: 2px solid {color};
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    ">
+      <div style="font-size: 1.2rem; font-weight: 600;">
+        {emoji} 今日の体調リスク：{label}
+      </div>
+      <div style="font-size: 0.95rem;">
+        総合スコア: <b>{total_score}</b>（ベース {base_score} + 今日の条件 {daily_score}）
+      </div>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+
+# =========================
+# Streamlit UI
+# =========================
+
+def profile_tab_ui(profile: Dict[str, Any]) -> Dict[str, Any]:
+    st.subheader("プロフィール設定（ベースリスク）")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        age = st.number_input("年齢", min_value=0, max_value=120, value=int(profile["age"]) if profile["age"] is not None else 40)
+        height_cm = st.number_input(
+            "身長（cm）", min_value=0.0, max_value=250.0,
+            value=float(profile["height_cm"]) if profile["height_cm"] is not None else 170.0,
+            step=0.5,
+        )
+    with col2:
+        weight_kg = st.number_input(
+            "体重（kg）", min_value=0.0, max_value=300.0,
+            value=float(profile["weight_kg"]) if profile["weight_kg"] is not None else 60.0,
+            step=0.5,
+        )
+        blood_type = st.text_input("血液型（任意：A/B/O/ABなど）", value=profile.get("blood_type", ""))
+
+    sex = st.selectbox("性別（任意）", ["未設定", "男性", "女性", "その他"], index=["未設定", "男性", "女性", "その他"].index(profile.get("sex", "未設定")))
+
+    st.markdown("#### 慢性疾患（当てはまるものにチェック）")
+    ch = profile["chronic"]
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        ch["migraine"] = st.checkbox("片頭痛", value=ch.get("migraine", False))
+        ch["tension_headache"] = st.checkbox("緊張型頭痛", value=ch.get("tension_headache", False))
+        ch["anxiety_depression"] = st.checkbox("不安・うつなど", value=ch.get("anxiety_depression", False))
+    with c2:
+        ch["asthma"] = st.checkbox("喘息", value=ch.get("asthma", False))
+        ch["copd"] = st.checkbox("COPD / 肺気腫", value=ch.get("copd", False))
+    with c3:
+        ch["hypertension"] = st.checkbox("高血圧", value=ch.get("hypertension", False))
+        ch["diabetes"] = st.checkbox("糖尿病", value=ch.get("diabetes", False))
+        ch["cvd"] = st.checkbox("心疾患（狭心症・不整脈など）", value=ch.get("cvd", False))
+
+    st.markdown("#### アレルギー")
+    al = profile["allergy"]
+    al["nsaids"] = st.checkbox("一部の痛み止め（ロキソニンなどNSAIDs）にアレルギーがある", value=al.get("nsaids", False))
+    al["antibiotics"] = st.checkbox("抗生物質でアレルギー歴がある", value=al.get("antibiotics", False))
+    al["food"] = st.text_input("食物アレルギー（あれば）", value=al.get("food", ""))
+    al["others"] = st.text_input("その他アレルギー（あれば）", value=al.get("others", ""))
+
+    if st.button("プロフィールを保存"):
+        profile["age"] = int(age)
+        profile["sex"] = sex
+        profile["height_cm"] = float(height_cm) if height_cm > 0 else None
+        profile["weight_kg"] = float(weight_kg) if weight_kg > 0 else None
+        profile["blood_type"] = blood_type
+        profile["chronic"] = ch
+        profile["allergy"] = al
+        save_profile(profile)
+        st.success("プロフィールを保存しました。")
+
+    bmi = calc_bmi(profile.get("height_cm"), profile.get("weight_kg"))
+    if bmi is not None:
+        st.info(f"BMI（参考値）: {bmi:.1f}")
+
+    base_score, base_reasons = calc_profile_base_risk(profile)
+    st.markdown("#### プロファイルによるベースリスク（参考）")
+    st.write(f"ベースリスクスコア: {base_score}（0〜3）")
+    if base_reasons:
+        for r in base_reasons:
+            st.write(f"- {r}")
+    else:
+        st.write("登録されているリスク要因は特にありません。")
+
+    return profile
+
+
+def main():
+    st.set_page_config(page_title="体調予報アプリ", page_icon="🩺", layout="wide")
+
+    st.title("体調予報アプリ 🩺（プロフィール＋気圧＋Gemini）")
+    st.caption(
+        "※このアプリは体調管理の目安であり、医師の診断や治療に代わるものではありません。"
+        " 強い痛み・息苦しさ・胸の痛み・意識の異常などがある場合は、速やかに医療機関を受診してください。"
+    )
+
+    if "profile" not in st.session_state:
+        st.session_state.profile = load_profile()
+    profile = st.session_state.profile
+
+    tab_today, tab_profile = st.tabs(["今日の体調", "プロフィール設定"])
+
+    with tab_profile:
+        profile = profile_tab_ui(profile)
+        st.session_state.profile = profile
+
+    with tab_today:
+        today = dt.date.today()
+        st.write(f"日付: {today}")
+
+        # ---------- 天気・気圧設定 ----------
+        st.markdown("### 1. 天気・気圧の設定（Open-Meteo）")
+
+        col_loc1, col_loc2, col_loc3 = st.columns([1.2, 1.2, 1])
+        with col_loc1:
+            latitude = st.number_input(
+                "緯度（latitude）", -90.0, 90.0, DEFAULT_LAT, 0.01
+            )
+        with col_loc2:
+            longitude = st.number_input(
+                "経度（longitude）", -180.0, 180.0, DEFAULT_LON, 0.01
+            )
+        with col_loc3:
+            use_auto_pressure = st.checkbox(
+                "気圧をAPIから自動取得する",
+                value=True
+            )
+
+        # ---------- 今日の状態入力 ----------
+        st.markdown("### 2. 今日の状態を入力")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            sleep_hours = st.number_input("昨夜の睡眠時間（時間）", 0.0, 15.0, 6.0, 0.5)
+            alcohol = st.checkbox("昨日アルコールを飲んだ", value=False)
+            steps = st.number_input(
+                "前日の歩数（だいたいでOK・不明なら0）", 0, 50000, 6000, 500
+            )
+            steps = steps if steps > 0 else None
+
+        with col2:
+            manual_pressure_drop = st.number_input(
+                "直近3時間の気圧変化（マイナスで低下）[hPa]（手動設定・API失敗時の予備）",
+                -20.0, 20.0, 0.0, 0.1
+            )
+            resting_hr_diff = st.number_input(
+                "安静時心拍（平常値との差）[bpm]",
+                -30.0, 30.0, 0.0, 1.0
+            )
+
+        user_note = st.text_area(
+            "今日の症状・気になること・予定など（任意）",
+            placeholder="例）左側の頭痛が気になる／午後に外出予定／鼻づまりがある　など"
+        )
+
+        st.markdown("---")
+
+        if st.button("体調リスクを判定してアドバイスと数日予報を見る"):
+            # -------------------------
+            # 気圧データ（API優先）
+            # -------------------------
+            pressure_drop = manual_pressure_drop
+            latest_pressure = None
+            times = None
+            pressures = None
+
+            if use_auto_pressure:
+                with st.spinner("Open-Meteoから気圧データを取得中..."):
+                    p_drop, latest, msg, times, pressures = fetch_pressure_from_open_meteo(
+                        latitude, longitude
+                    )
+                st.info(msg)
+
+                if p_drop is not None:
+                    pressure_drop = p_drop
+                if latest is not None:
+                    latest_pressure = latest
+
+            # -------------------------
+            # ベースリスク＆今日のリスク
+            # -------------------------
+            base_score, base_reasons = calc_profile_base_risk(profile)
+            daily_score, daily_reasons = calc_daily_risk(
+                sleep_hours,
+                alcohol,
+                pressure_drop,
+                resting_hr_diff,
+                steps,
+            )
+            total_score = base_score + daily_score
+            label, color, emoji = classify_total_risk(total_score)
+
+            st.markdown("### 3. 今日の総合リスク")
+
+            risk_card(label, color, emoji, total_score, base_score, daily_score)
+
+            if latest_pressure is not None:
+                st.write(f"現在の気圧（参考値）: {latest_pressure:.1f} hPa")
+            st.write(f"直近3時間の気圧変化（判定に使用）: {pressure_drop:+.1f} hPa")
+
+            st.markdown("#### ベースリスク要因（プロフィール由来）")
+            if base_reasons:
+                for r in base_reasons:
+                    st.write(f"- {r}")
+            else:
+                st.write("特に大きなベースリスク要因は登録されていません。")
+
+            st.markdown("#### 今日の追加リスク要因（状態・環境）")
+            if daily_reasons:
+                for r in daily_reasons:
+                    st.write(f"- {r}")
+            else:
+                st.write("今日の条件から大きなリスク要因は検出されていません。")
+
+            # -------------------------
+            # Gemini による詳細アドバイス
+            # -------------------------
+            st.markdown("---")
+            st.markdown("### 4. Gemini による今日の詳細アドバイス")
+
+            profile_summary = summarize_profile_for_gemini(profile)
+
+            if client is None:
+                st.info(
+                    "GeminiのAPIキーが設定されていないため、詳細アドバイスは利用できません。\n"
+                    "環境変数 GEMINI_API_KEY を設定すると、ここにAIからのコメントが表示されます。"
+                )
+            else:
+                with st.spinner("Geminiからアドバイスを取得中..."):
+                    gemini_text = call_gemini_for_advice(
+                        profile_summary,
+                        label,
+                        total_score,
+                        base_score,
+                        daily_score,
+                        base_reasons,
+                        daily_reasons,
+                        sleep_hours,
+                        alcohol,
+                        pressure_drop,
+                        resting_hr_diff,
+                        steps,
+                        user_note,
+                    )
+                st.write(gemini_text)
+
+            # -------------------------
+            # 向こう数日の気圧ベース体調リスク予報
+            # -------------------------
+            st.markdown("---")
+            st.markdown("### 5. 向こう数日の気圧ベース体調リスク予報")
+
+            if times is None or pressures is None:
+                st.info(
+                    "気圧データが取得できていないため、数日予報は表示できません。"
+                )
+            else:
+                forecast_days = make_pressure_forecast(times, pressures, days_ahead=7)
+
+                if not forecast_days:
+                    st.write("数日分の気圧予報が取得できませんでした。")
+                else:
+                    for day_info in forecast_days:
+                        d = day_info["date"]
+                        d_label = day_info["label"]
+                        max_drop = day_info["max_drop_3h"]
+                        min_p = day_info["min_pressure"]
+                        reasons_f = day_info["reasons"]
+
+                        if d_label == "低":
+                            icon = "🟢"
+                        elif d_label == "中":
+                            icon = "🟡"
+                        else:
+                            icon = "🔴"
+
+                        st.write(
+                            f"**{d} のリスク：{icon} {d_label}** "
+                            f"(最大3時間変化: {max_drop:+.1f} hPa, 最低気圧: {min_p:.1f} hPa)"
+                        )
+                        if reasons_f:
+                            for r in reasons_f:
+                                st.write(f"- {r}")
+
+            st.caption(
+                "※このアプリは体調管理の目安であり、医師の診断や治療に代わるものではありません。"
+                " 強い痛みや息苦しさ、胸の痛み、顔面の麻痺、意識の異常などがある場合は、"
+                "スコアに関わらず速やかに医療機関を受診してください。"
+            )
+
+
+if __name__ == "__main__":
+    main()
