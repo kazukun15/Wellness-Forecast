@@ -1,13 +1,14 @@
 import os
 import json
 import datetime as dt
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 import html
 
 import requests
 import streamlit as st
-
+import pandas as pd
+import altair as alt
 
 # ==================================================
 # Optional: Gemini
@@ -17,74 +18,133 @@ try:
     from google import genai
     from google.genai import types
     GEMINI_AVAILABLE = True
-except Exception:
+except ImportError:
     GEMINI_AVAILABLE = False
 
-
 # ==================================================
-# Settings
+# Constants & Settings
 # ==================================================
 APP_TITLE = "Wellness Forecast"
 PROFILE_PATH = "profile.json"
-
-DEFAULT_LAT = 34.25
-DEFAULT_LON = 133.20
-
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-client = None
-if GEMINI_AVAILABLE and GEMINI_API_KEY:
-    try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-    except Exception:
-        client = None
 
-
-# ==================================================
-# Utilities
-# ==================================================
-def safe_html_text(text: Optional[str]) -> str:
-    if not text:
-        return ""
-    return html.escape(text).replace("\n", "<br>")
-
-
-def fmt_opt(x: Optional[float], fmt: str) -> str:
-    if x is None:
-        return "—"
-    try:
-        return format(float(x), fmt)
-    except Exception:
-        return "—"
-
+# 日本の主要都市プリセット (緯度, 経度)
+CITIES = {
+    "東京": (35.6895, 139.6917),
+    "大阪": (34.6937, 135.5023),
+    "名古屋": (35.1815, 136.9066),
+    "札幌": (43.0618, 141.3545),
+    "福岡": (33.5904, 130.4017),
+    "仙台": (38.2682, 140.8694),
+    "広島": (34.3853, 132.4553),
+    "那覇": (26.2124, 127.6809),
+    "金沢": (36.5613, 136.6562),
+    "高松": (34.3428, 134.0466),
+    "手動入力": (None, None)
+}
 
 # ==================================================
-# Profile
+# Gemini Client
+# ==================================================
+@st.cache_resource
+def get_gemini_client():
+    if GEMINI_AVAILABLE and GEMINI_API_KEY:
+        try:
+            return genai.Client(api_key=GEMINI_API_KEY)
+        except Exception:
+            return None
+    return None
+
+client = get_gemini_client()
+
+# ==================================================
+# CSS Styling
+# ==================================================
+def inject_css():
+    css = """
+    <style>
+    :root{
+      --wf-text: #2f2f2f;
+      --wf-text-sub: #555555;
+      --wf-bg-card: rgba(255, 255, 255, 0.85);
+      --wf-border: rgba(0,0,0,0.08);
+    }
+    
+    .stApp {
+        background: 
+          radial-gradient(circle at 15% 10%, rgba(255, 214, 102, 0.25), transparent 40%),
+          radial-gradient(circle at 85% 15%, rgba(186, 104, 200, 0.20), transparent 42%),
+          radial-gradient(circle at 20% 90%, rgba(129, 199, 132, 0.20), transparent 45%),
+          radial-gradient(circle at 90% 85%, rgba(79, 195, 247, 0.20), transparent 45%),
+          #fbfbff;
+        color: var(--wf-text);
+    }
+
+    /* General Text Color Force */
+    html, body, [class*="css"], .stMarkdown, div, p, li, label, h1, h2, h3 {
+        color: var(--wf-text) !important;
+        font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Hiragino Sans", Meiryo, sans-serif;
+    }
+    
+    .stMarkdown small {
+        color: var(--wf-text-sub) !important;
+    }
+
+    /* Cards */
+    .wf-card {
+        background: var(--wf-bg-card);
+        border: 1px solid var(--wf-border);
+        border-radius: 16px;
+        padding: 1rem 1.2rem;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.03);
+        margin-bottom: 1rem;
+        backdrop-filter: blur(10px);
+    }
+
+    .wf-section-title {
+        font-size: 1.1rem;
+        font-weight: 800;
+        margin-top: 1.5rem;
+        margin-bottom: 0.8rem;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+
+    /* Streamlit Components adjustment */
+    .stButton>button {
+        border-radius: 12px !important;
+        font-weight: 700 !important;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05) !important;
+    }
+    
+    /* Metrics */
+    [data-testid="stMetricValue"] {
+        color: var(--wf-text) !important;
+    }
+    [data-testid="stMetricLabel"] {
+        color: var(--wf-text-sub) !important;
+    }
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+
+# ==================================================
+# Profile Logic
 # ==================================================
 def default_profile() -> Dict[str, Any]:
     return {
-        "age": None,
-        "sex": "未設定",
-        "height_cm": None,
-        "weight_kg": None,
+        "age": 40, "sex": "未設定", "height_cm": 170.0, "weight_kg": 60.0,
         "blood_type": "",
         "chronic": {
-            "migraine": False,
-            "tension_headache": False,
-            "asthma": False,
-            "copd": False,
-            "hypertension": False,
-            "diabetes": False,
-            "cvd": False,
-            "anxiety_depression": False,
+            "migraine": False, "tension_headache": False, "asthma": False,
+            "copd": False, "hypertension": False, "diabetes": False,
+            "cvd": False, "anxiety_depression": False,
         },
         "allergy": {
-            "nsaids": False,
-            "antibiotics": False,
-            "food": "",
-            "others": "",
+            "nsaids": False, "antibiotics": False, "food": "", "others": "",
         },
     }
-
 
 def load_profile() -> Dict[str, Any]:
     if os.path.exists(PROFILE_PATH):
@@ -92,16 +152,14 @@ def load_profile() -> Dict[str, Any]:
             with open(PROFILE_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             base = default_profile()
-            base.update(data)
-            for k, v in default_profile()["chronic"].items():
-                base["chronic"].setdefault(k, v)
-            for k, v in default_profile()["allergy"].items():
-                base["allergy"].setdefault(k, v)
+            # Deep update for nested dicts
+            base.update({k: v for k, v in data.items() if k not in ["chronic", "allergy"]})
+            base["chronic"].update(data.get("chronic", {}))
+            base["allergy"].update(data.get("allergy", {}))
             return base
         except Exception:
             return default_profile()
     return default_profile()
-
 
 def save_profile(profile: Dict[str, Any]) -> None:
     try:
@@ -110,986 +168,382 @@ def save_profile(profile: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-
 def calc_bmi(height_cm: Optional[float], weight_kg: Optional[float]) -> Optional[float]:
     if not height_cm or not weight_kg or height_cm <= 0:
         return None
-    h_m = height_cm / 100.0
-    return weight_kg / (h_m * h_m)
-
+    return weight_kg / ((height_cm / 100.0) ** 2)
 
 def calc_profile_base_risk(profile: Dict[str, Any]) -> Tuple[int, List[str]]:
     score = 0
-    reasons: List[str] = []
+    reasons = []
 
-    age = profile.get("age")
-    if age is not None:
-        if age >= 60:
-            score += 2
-            reasons.append("60歳以上で、体調が崩れやすい年齢帯です。")
-        elif age >= 40:
-            score += 1
-            reasons.append("40代以降で、回復に時間がかかりやすい時期です。")
+    age = profile.get("age", 40)
+    if age >= 60:
+        score += 2; reasons.append("60歳以上 (回復力低下のリスク)")
+    elif age >= 40:
+        score += 1; reasons.append("40代以降 (体調変化のリスク)")
 
     bmi = calc_bmi(profile.get("height_cm"), profile.get("weight_kg"))
-    if bmi is not None:
+    if bmi:
         if bmi < 18.5:
-            score += 1
-            reasons.append("やせ気味（BMI<18.5）で、冷え・疲れが出やすいことがあります。")
-        elif 25 <= bmi < 30:
-            score += 1
-            reasons.append("BMIがやや高めで、疲労が残りやすい場合があります。")
+            score += 1; reasons.append("低体重 (冷え・スタミナ不足)")
         elif bmi >= 30:
-            score += 2
-            reasons.append("肥満（BMI≥30）で、体への負担が大きい状態です。")
+            score += 2; reasons.append("肥満 (循環器・関節への負担)")
+        elif bmi >= 25:
+            score += 1; reasons.append("過体重 (疲労蓄積)")
 
-    chronic = profile.get("chronic", {})
-    if chronic.get("migraine"):
-        score += 1
-        reasons.append("片頭痛があり、気圧や睡眠の影響を受けやすいです。")
-    if chronic.get("asthma") or chronic.get("copd"):
-        score += 1
-        reasons.append("呼吸器の持病があり、寒さや風邪の影響を受けやすいです。")
-    if chronic.get("hypertension") or chronic.get("cvd"):
-        score += 1
-        reasons.append("血圧・心臓に注意が必要な背景があります。")
-    if chronic.get("diabetes"):
-        score += 1
-        reasons.append("血糖の影響で体調変化が出やすい場合があります。")
-    if chronic.get("anxiety_depression"):
-        score += 1
-        reasons.append("ストレス・睡眠の影響を受けやすい背景があります。")
+    c = profile.get("chronic", {})
+    if c.get("migraine"): score += 1; reasons.append("片頭痛 (気圧変化に敏感)")
+    if c.get("asthma") or c.get("copd"): score += 1; reasons.append("呼吸器疾患 (気温差・乾燥に敏感)")
+    if c.get("hypertension") or c.get("cvd"): score += 1; reasons.append("循環器リスク")
+    if c.get("diabetes"): score += 1; reasons.append("血糖・代謝リスク")
+    if c.get("anxiety_depression"): score += 1; reasons.append("メンタル不調 (自律神経)")
 
     return min(score, 3), reasons
 
-
-def summarize_profile_for_gemini(profile: Dict[str, Any]) -> str:
+def get_profile_summary_text(profile: Dict[str, Any]) -> str:
     parts = []
-    age = profile.get("age")
-
-    if age is not None:
-        if age < 30:
-            parts.append("20〜30代前半")
-        elif age < 40:
-            parts.append("30代後半")
-        elif age < 50:
-            parts.append("40代")
-        elif age < 60:
-            parts.append("50代")
-        else:
-            parts.append("60代以上")
-    else:
-        parts.append("年齢不明")
-
-    bmi = calc_bmi(profile.get("height_cm"), profile.get("weight_kg"))
-    if bmi is not None:
-        if bmi < 18.5:
-            parts.append("やせ気味")
-        elif bmi >= 30:
-            parts.append("肥満傾向")
-        elif bmi >= 25:
-            parts.append("少しぽっちゃり")
-        else:
-            parts.append("ほぼ標準体型")
-
-    chronic = profile.get("chronic", {})
-    tags = []
-    if chronic.get("migraine"):
-        tags.append("片頭痛")
-    if chronic.get("asthma") or chronic.get("copd"):
-        tags.append("呼吸器")
-    if chronic.get("hypertension") or chronic.get("cvd"):
-        tags.append("血圧・心臓")
-    if chronic.get("diabetes"):
-        tags.append("糖代謝")
-    if chronic.get("anxiety_depression"):
-        tags.append("メンタル")
-    if tags:
-        parts.append("注意点: " + "・".join(tags))
-
-    allergy = profile.get("allergy", {})
-    if allergy.get("nsaids"):
-        parts.append("NSAIDsに注意")
-
+    parts.append(f"{profile.get('age', '?')}歳")
+    parts.append(profile.get('sex', '性別不明'))
+    c = profile.get("chronic", {})
+    conditions = [k for k, v in c.items() if v]
+    if conditions:
+        parts.append(f"持病: {', '.join(conditions)}")
     return " / ".join(parts)
 
-
 # ==================================================
-# Open-Meteo fetch
+# Weather Logic (Cached)
 # ==================================================
-def fetch_weather_from_open_meteo(latitude: float, longitude: float) -> Tuple[Optional[float], Optional[float], str, Optional[Dict[str, Any]]]:
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def fetch_weather_data(lat: float, lon: float) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     url = "https://api.open-meteo.com/v1/forecast"
-    hourly_fields = [
-        "pressure_msl",
-        "temperature_2m",
-        "apparent_temperature",
-        "relative_humidity_2m",
-        "precipitation",
-        "rain",
-        "wind_speed_10m",
-        "wind_gusts_10m",
-        "cloud_cover",
-    ]
     params = {
-        "latitude": latitude,
-        "longitude": longitude,
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": ["temperature_2m", "relative_humidity_2m", "apparent_temperature", 
+                   "precipitation", "pressure_msl", "wind_speed_10m"],
         "timezone": "auto",
-        "hourly": ",".join(hourly_fields),
+        "past_days": 1,  # Get yesterday's data to calculate pressure trend smoothly
+        "forecast_days": 7
     }
-
+    
     try:
-        resp = requests.get(url, params=params, timeout=12)
+        resp = requests.get(url, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-
+        
         hourly = data.get("hourly", {})
-        times = hourly.get("time", [])
-        if not times:
-            return None, None, "天気データの時刻情報が取得できませんでした。", None
-
-        def get_series(name: str):
-            s = hourly.get(name)
-            return s if isinstance(s, list) and len(s) == len(times) else None
-
-        series = {"time": times}
-        for f in hourly_fields:
-            series[f] = get_series(f)
-
-        if series.get("pressure_msl") is None:
-            return None, None, "気圧データが取得できませんでした。", None
-
-        pressures = [float(x) for x in series["pressure_msl"]]
-        latest_p = float(pressures[-1])
-
-        pressure_drop_3h = None
-        if len(pressures) >= 4:
-            pressure_drop_3h = latest_p - float(pressures[-4])
-
-        def latest_float(key: str) -> Optional[float]:
-            s = series.get(key)
-            if not s:
-                return None
-            try:
-                return float(s[-1])
-            except Exception:
-                return None
-
-        temp = latest_float("temperature_2m")
-        feels = latest_float("apparent_temperature")
-        rh = latest_float("relative_humidity_2m")
-        wind = latest_float("wind_speed_10m")
-        prec = latest_float("precipitation")
-
-        msg_lines = ["天気データを取得しました。"]
-        msg_lines.append(f"・現在の気圧: {latest_p:.1f} hPa")
-        if pressure_drop_3h is not None:
-            msg_lines.append(f"・直近3時間の気圧変化: {pressure_drop_3h:+.1f} hPa")
-        if temp is not None:
-            msg_lines.append(f"・気温: {temp:.1f} ℃")
-        if feels is not None:
-            msg_lines.append(f"・体感温度: {feels:.1f} ℃")
-        if rh is not None:
-            msg_lines.append(f"・湿度: {rh:.0f} %")
-        if wind is not None:
-            msg_lines.append(f"・風速: {wind:.1f} m/s")
-        if prec is not None:
-            msg_lines.append(f"・降水（1時間）: {prec:.1f} mm")
-
-        bundle = {"hourly": series, "timezone": data.get("timezone", "")}
-        return pressure_drop_3h, latest_p, "\n".join(msg_lines), bundle
-
+        if not hourly.get("time"):
+            return None, "No data available."
+            
+        df = pd.DataFrame(hourly)
+        df["time"] = pd.to_datetime(df["time"])
+        return df, None
     except Exception as e:
-        return None, None, f"天気データの取得に失敗しました: {e}", None
+        return None, str(e)
+
+def analyze_weather_risk(df: pd.DataFrame) -> Tuple[int, List[str], Dict[str, float]]:
+    """Analyzes the *current* weather risk based on the latest available data point."""
+    now = datetime.now()
+    # Find the row closest to current time
+    current_df = df.iloc[(df['time'] - now).abs().argsort()[:1]]
+    
+    if current_df.empty:
+        return 0, ["データがありません"], {}
+        
+    row = current_df.iloc[0]
+    
+    # Calculate pressure drop (compare with 3 hours ago)
+    # We need to find the row 3 hours before this row
+    idx_3h_ago = (df['time'] - (row['time'] - timedelta(hours=3))).abs().argsort()[:1]
+    p_now = row["pressure_msl"]
+    p_prev = df.iloc[idx_3h_ago].iloc[0]["pressure_msl"]
+    p_drop = p_now - p_prev
+
+    score = 0
+    reasons = []
+    
+    # Pressure
+    if p_drop <= -4:
+        score += 2; reasons.append(f"急激な気圧低下 ({p_drop:+.1f} hPa/3h)")
+    elif p_drop <= -2:
+        score += 1; reasons.append(f"気圧低下の傾向 ({p_drop:+.1f} hPa/3h)")
+        
+    # Temperature/Feels Like
+    feels = row["apparent_temperature"]
+    if feels <= 5:
+        score += 1; reasons.append("強い冷え込み")
+    elif feels >= 30:
+        score += 1; reasons.append("暑さによる消耗")
+        
+    # Humidity
+    rh = row["relative_humidity_2m"]
+    if rh <= 25: score += 1; reasons.append("極度の乾燥")
+    elif rh >= 80: score += 1; reasons.append("高湿度・蒸れ")
+    
+    # Wind/Rain
+    if row["precipitation"] >= 1.0: score += 1; reasons.append("降雨")
+    if row["wind_speed_10m"] >= 8.0: score += 1; reasons.append("強風")
+
+    snapshot = {
+        "temp": row["temperature_2m"],
+        "pressure": p_now,
+        "pressure_drop": p_drop,
+        "humidity": rh,
+        "wind": row["wind_speed_10m"],
+        "precip": row["precipitation"]
+    }
+    
+    return min(score, 3), reasons, snapshot
+
+def create_weather_chart(df: pd.DataFrame):
+    """Creates an Altair chart for Temp & Pressure forecast."""
+    now = datetime.now()
+    # Filter for next 48 hours
+    chart_df = df[(df['time'] >= now - timedelta(hours=3)) & (df['time'] <= now + timedelta(hours=48))].copy()
+    
+    if chart_df.empty:
+        return st.write("No data for chart.")
+
+    base = alt.Chart(chart_df).encode(x=alt.X('time:T', axis=alt.Axis(format='%d日 %H時', title='日時')))
+
+    # Pressure (Area)
+    pressure = base.mark_line(color='#A8A4CE', strokeWidth=3).encode(
+        y=alt.Y('pressure_msl:Q', scale=alt.Scale(zero=False), axis=alt.Axis(title='気圧 (hPa)', titleColor='#A8A4CE'))
+    )
+    
+    # Temperature (Line)
+    temp = base.mark_line(color='#FFD666', strokeWidth=3).encode(
+        y=alt.Y('temperature_2m:Q', scale=alt.Scale(zero=False), axis=alt.Axis(title='気温 (℃)', titleColor='#E6B422'))
+    )
+
+    chart = alt.layer(pressure, temp).resolve_scale(y='independent').properties(
+        height=250, title="今後48時間の気圧(紫)と気温(黄)の推移"
+    ).interactive()
+    
+    st.altair_chart(chart, use_container_width=True)
 
 
 # ==================================================
-# Risk calculation
+# Daily & Total Risk
 # ==================================================
-def calc_daily_risk(
-    sleep_hours: float,
-    alcohol: bool,
-    pressure_drop_3h: Optional[float],
-    resting_hr_diff: float,
-    steps: Optional[int],
+def calc_daily_lifestyle_risk(
+    sleep: float, alcohol: bool, steps: Optional[int], rhr_diff: float
 ) -> Tuple[int, List[str]]:
     score = 0
-    reasons: List[str] = []
+    reasons = []
 
-    if pressure_drop_3h is not None:
-        if pressure_drop_3h <= -4:
-            score += 2
-            reasons.append("直近3時間で4hPa以上の気圧低下がありそうです。")
-        elif pressure_drop_3h <= -2:
-            score += 1
-            reasons.append("直近3時間で2〜4hPa程度の気圧低下がありそうです。")
-
-    if sleep_hours < 5.5:
-        score += 2
-        reasons.append("睡眠がかなり少なめ（5.5時間未満）です。")
-    elif sleep_hours < 6.5:
-        score += 1
-        reasons.append("睡眠が少し少なめ（6.5時間未満）です。")
-
-    if alcohol:
-        score += 1
-        reasons.append("前日にお酒があり、体の負担が残ることがあります。")
-
-    if resting_hr_diff >= 8:
-        score += 2
-        reasons.append("安静時心拍がいつもより8bpm以上高めです。")
-    elif resting_hr_diff >= 4:
-        score += 1
-        reasons.append("安静時心拍が少し高めです。")
-
+    if sleep < 5.5: score += 2; reasons.append("睡眠不足 (5.5h未満)")
+    elif sleep < 6.5: score += 1; reasons.append("睡眠不足気味")
+    
+    if alcohol: score += 1; reasons.append("アルコール摂取翌日")
+    
+    if rhr_diff >= 8: score += 2; reasons.append("心拍高値 (疲労/ストレス)")
+    elif rhr_diff >= 4: score += 1; reasons.append("心拍やや高め")
+    
     if steps is not None:
-        if steps < 2000:
-            score += 1
-            reasons.append("歩数が少なく、だるさが出やすいことがあります。")
-        elif steps > 15000:
-            score += 1
-            reasons.append("活動量が多く、疲れが残ることがあります。")
+        if steps < 2000: score += 1; reasons.append("活動量不足 (血行不良)")
+        elif steps > 15000: score += 1; reasons.append("活動過多 (疲労蓄積)")
 
     return score, reasons
 
-
-def add_weather_risk_from_latest(hourly: Dict[str, Any]) -> Tuple[int, List[str], Dict[str, Optional[float]]]:
-    score = 0
-    reasons: List[str] = []
-
-    def lastf(key: str) -> Optional[float]:
-        s = hourly.get(key)
-        if not s:
-            return None
-        try:
-            return float(s[-1])
-        except Exception:
-            return None
-
-    temp = lastf("temperature_2m")
-    feels = lastf("apparent_temperature")
-    rh = lastf("relative_humidity_2m")
-    prec = lastf("precipitation")
-    wind = lastf("wind_speed_10m")
-
-    ref = feels if feels is not None else temp
-
-    if ref is not None:
-        if ref <= 0:
-            score += 2
-            reasons.append("体感がかなり寒い（0℃以下）ため、冷えの負担が増えます。")
-        elif ref <= 5:
-            score += 1
-            reasons.append("体感が寒め（5℃以下）で、冷えに注意です。")
-        elif ref >= 33:
-            score += 2
-            reasons.append("体感がかなり暑い（33℃以上）ため、だるさが出やすいです。")
-        elif ref >= 30:
-            score += 1
-            reasons.append("体感が暑め（30℃以上）で、負担が増えやすいです。")
-
-    if rh is not None:
-        if rh <= 25:
-            score += 1
-            reasons.append("湿度がかなり低め（25%以下）で、乾燥の負担が出やすいです。")
-        elif rh >= 80:
-            score += 1
-            reasons.append("湿度が高め（80%以上）で、だるさが出やすいです。")
-
-    if prec is not None:
-        if prec >= 5:
-            score += 2
-            reasons.append("降水が強め（1時間5mm以上）で、冷えや負担が増えやすいです。")
-        elif prec >= 1:
-            score += 1
-            reasons.append("雨（降水）があり、負担が増えやすいです。")
-
-    if wind is not None:
-        if wind >= 10:
-            score += 2
-            reasons.append("風がかなり強め（10m/s以上）で、体感が下がりやすいです。")
-        elif wind >= 8:
-            score += 1
-            reasons.append("風が強めで、体感が下がりやすいです。")
-
-    snapshot = {
-        "temperature_2m": temp,
-        "apparent_temperature": feels,
-        "relative_humidity_2m": rh,
-        "precipitation": prec,
-        "wind_speed_10m": wind,
-    }
-    return score, reasons, snapshot
-
-
-def classify_total_risk(total_score: int) -> Tuple[str, str, str]:
-    if total_score <= 2:
-        return "おちついている", "#3CB371", "🟢"
-    elif total_score <= 6:
-        return "少し注意したい", "#FFD54F", "🟡"
-    else:
-        return "今日はかなり慎重に", "#FF6B6B", "🔴"
-
+def get_risk_level_info(total_score: int) -> Tuple[str, str, str]:
+    if total_score <= 3: return "良好〜安定", "#4CAF50", "🟢"
+    elif total_score <= 6: return "少し注意", "#FFC107", "🟡"
+    else: return "要警戒", "#FF5252", "🔴"
 
 # ==================================================
-# Forecast (daily from hourly)
+# AI Advice
 # ==================================================
-def _parse_iso(ts: str) -> Optional[datetime]:
-    try:
-        return datetime.fromisoformat(ts)
-    except Exception:
-        return None
-
-
-def build_daily_forecast_from_hourly(series: Dict[str, Any], days_ahead: int = 14) -> List[Dict[str, Any]]:
-    times = series.get("time", [])
-    if not times:
-        return []
-
-    idx_by_date: Dict[dt.date, List[int]] = {}
-    for i, t in enumerate(times):
-        dtt = _parse_iso(t)
-        if not dtt:
-            continue
-        idx_by_date.setdefault(dtt.date(), []).append(i)
-
-    today = dt.date.today()
-    dates = sorted([d for d in idx_by_date.keys() if d >= today])[:max(1, days_ahead)]
-    if not dates:
-        return []
-
-    def get_f(key: str, i: int) -> Optional[float]:
-        arr = series.get(key)
-        if not arr:
-            return None
-        try:
-            return float(arr[i])
-        except Exception:
-            return None
-
-    out: List[Dict[str, Any]] = []
-    for d in dates:
-        idxs = idx_by_date[d]
-        pressures = [get_f("pressure_msl", i) for i in idxs]
-        pressures = [p for p in pressures if p is not None]
-        if not pressures:
-            continue
-
-        min_pressure = float(min(pressures))
-
-        max_drop_3h = 0.0
-        for j in range(3, len(idxs)):
-            p_now = get_f("pressure_msl", idxs[j])
-            p_prev = get_f("pressure_msl", idxs[j - 3])
-            if p_now is None or p_prev is None:
-                continue
-            drop = float(p_now - p_prev)
-            if drop < max_drop_3h:
-                max_drop_3h = drop
-
-        temps = [get_f("temperature_2m", i) for i in idxs if get_f("temperature_2m", i) is not None]
-        feels = [get_f("apparent_temperature", i) for i in idxs if get_f("apparent_temperature", i) is not None]
-        rh = [get_f("relative_humidity_2m", i) for i in idxs if get_f("relative_humidity_2m", i) is not None]
-        prec = [get_f("precipitation", i) for i in idxs if get_f("precipitation", i) is not None]
-        wind = [get_f("wind_speed_10m", i) for i in idxs if get_f("wind_speed_10m", i) is not None]
-
-        min_temp = float(min(temps)) if temps else None
-        max_temp = float(max(temps)) if temps else None
-        min_feels = float(min(feels)) if feels else None
-        max_feels = float(max(feels)) if feels else None
-        min_rh = float(min(rh)) if rh else None
-        max_rh = float(max(rh)) if rh else None
-        prec_sum = float(sum(prec)) if prec else 0.0
-        wind_max = float(max(wind)) if wind else None
-
-        score = 0
-        reasons: List[str] = []
-
-        if max_drop_3h <= -6.0:
-            score += 2
-            reasons.append("3時間で6hPa以上の急な気圧低下がありそうです。")
-        elif max_drop_3h <= -3.0:
-            score += 1
-            reasons.append("3時間で3〜6hPa程度の気圧低下がありそうです。")
-
-        if min_pressure < 1000.0:
-            score += 2
-            reasons.append("気圧が1000hPa未満の時間帯がありそうです。")
-        elif min_pressure < 1005.0:
-            score += 1
-            reasons.append("気圧が1005hPa未満の時間帯がありそうです。")
-
-        ref_min = min_feels if min_feels is not None else min_temp
-        ref_max = max_feels if max_feels is not None else max_temp
-
-        if ref_min is not None:
-            if ref_min <= 0:
-                score += 2
-                reasons.append("体感がかなり寒い（0℃以下）の時間帯がありそうです。")
-            elif ref_min <= 5:
-                score += 1
-                reasons.append("体感が寒め（5℃以下）の時間帯がありそうです。")
-
-        if ref_max is not None:
-            if ref_max >= 33:
-                score += 2
-                reasons.append("体感がかなり暑い（33℃以上）の時間帯がありそうです。")
-            elif ref_max >= 30:
-                score += 1
-                reasons.append("体感が暑め（30℃以上）の時間帯がありそうです。")
-
-        if min_temp is not None and max_temp is not None:
-            swing = max_temp - min_temp
-            if swing >= 12:
-                score += 2
-                reasons.append("日内の気温差が大きめ（12℃以上）です。")
-            elif swing >= 8:
-                score += 1
-                reasons.append("日内の気温差がやや大きめ（8℃以上）です。")
-
-        if min_rh is not None and min_rh <= 25:
-            score += 1
-            reasons.append("湿度がかなり低い（25%以下）時間帯がありそうです。")
-        if max_rh is not None and max_rh >= 80:
-            score += 1
-            reasons.append("湿度が高い（80%以上）時間帯がありそうです。")
-
-        if prec_sum >= 20:
-            score += 2
-            reasons.append("降水量が多め（合計20mm以上）になりそうです。")
-        elif prec_sum >= 5:
-            score += 1
-            reasons.append("雨が降りそう（合計5mm以上）です。")
-
-        if wind_max is not None:
-            if wind_max >= 10:
-                score += 2
-                reasons.append("風がかなり強め（最大10m/s以上）になりそうです。")
-            elif wind_max >= 8:
-                score += 1
-                reasons.append("風が強め（最大8m/s以上）になりそうです。")
-
-        label = "低め" if score <= 2 else ("やや高め" if score <= 5 else "高め")
-
-        out.append(
-            {
-                "date": d,  # dt.date
-                "label": label,
-                "score": int(score),
-                "min_pressure": float(min_pressure),
-                "max_drop_3h": float(max_drop_3h),
-                "min_temp": min_temp,
-                "max_temp": max_temp,
-                "min_feels": min_feels,
-                "max_feels": max_feels,
-                "min_rh": min_rh,
-                "max_rh": max_rh,
-                "prec_sum": float(prec_sum),
-                "wind_max": wind_max,
-                "reasons": reasons,
-            }
-        )
-
-    return out
-
-
-# ==================================================
-# Gemini advice
-# ==================================================
-def call_gemini_for_advice(
-    profile_summary: str,
-    risk_label: str,
-    total_score: int,
-    base_score: int,
-    daily_score: int,
-    base_reasons: List[str],
-    daily_reasons: List[str],
-    user_note: str,
-) -> Optional[str]:
-    if client is None:
-        return None
-
-    base_text = "\n".join(f"- {r}" for r in base_reasons) if base_reasons else "特になし"
-    daily_text = "\n".join(f"- {r}" for r in daily_reasons) if daily_reasons else "特になし"
+def generate_gemini_advice(
+    profile_summary: str, risk_label: str, total_score: int, 
+    all_reasons: List[str], user_note: str
+) -> str:
+    if not client:
+        return "Gemini APIキーが設定されていません。"
 
     prompt = f"""
-あなたは日本人の成人に対して、医学的常識に沿った「ふだんの養生アドバイス」を行う専門家です。
-診断や治療の指示は行わず、日常生活の工夫と、必要な場合の受診の目安だけを伝えてください。
+    あなたは親しみやすい「専属ウェルネス・コンシェルジュ」です。
+    ユーザーの今日の体調リスクスコアと要因に基づき、今日一日を快適に過ごすための具体的なアドバイスをください。
 
-【背景（プロフィール要約）】
-{profile_summary}
+    【ユーザー情報】
+    - プロフィール: {profile_summary}
+    - 今日のリスクレベル: {risk_label} (スコア: {total_score}/10)
+    - リスク要因: {', '.join(all_reasons)}
+    - ユーザーメモ: {user_note}
 
-【今日の総合リスク】
-- レベル: {risk_label}
-- トータルスコア: {total_score}（ベース {base_score} + 今日の条件 {daily_score}）
-
-【ベース要因】
-{base_text}
-
-【今日の要因】
-{daily_text}
-
-【本人メモ】
-{user_note if user_note else "特になし"}
-
-【出力条件】
-- 日本語・ですます調
-- 800字以内
-- 構成：
-  1) 今日の状態イメージ（3〜5行）
-  2) 今日のおすすめ（箇条書き3〜5）
-  3) 受診の目安（2〜4）
-- 薬の具体名は出さない
-- 危険サインが疑われる場合は「早めに医療機関の受診を検討してください」を入れる
-""".strip()
-
+    【指示】
+    1. ユーザーを労う一言から始めてください。
+    2. リスク要因に対する具体的な対策（食事、運動、休息、環境調整など）を3つ提案してください。
+    3. 全体的に「優しく、前向きな」トーンで。
+    4. 医療行為や断定的な診断は避けてください。
+    5. 400文字以内でまとめてください。
+    """
     try:
         resp = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.0-flash", # Use latest fast model
             contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.4),
         )
         return resp.text
     except Exception as e:
-        return f"Geminiの呼び出しに失敗しました: {e}"
-
-
-# ==================================================
-# UI: CSS（文字色を濃い灰色に固定）
-# ==================================================
-def inject_css():
-    css = """
-    <style>
-    :root{
-      --wf-text: #2f2f2f;     /* ✅ 文字色（濃い灰色） */
-      --wf-text-sub: #4a4a4a; /* ✅ 補助テキスト */
-      --wf-link: #1e5eff;
-    }
-
-    .stApp {
-        background:
-          radial-gradient(circle at 15% 10%, rgba(255, 214, 102, 0.35), transparent 40%),
-          radial-gradient(circle at 85% 15%, rgba(186, 104, 200, 0.28), transparent 42%),
-          radial-gradient(circle at 20% 90%, rgba(129, 199, 132, 0.28), transparent 45%),
-          radial-gradient(circle at 90% 85%, rgba(79, 195, 247, 0.25), transparent 45%),
-          #fbfbff;
-        overflow-x: hidden;
-        color: var(--wf-text);
-    }
-
-    /* ✅ Streamlit全体に強制で文字色を適用 */
-    html, body, [class*="css"], .stMarkdown, .stMarkdown p, .stMarkdown li, .stMarkdown span,
-    div, p, li, label, textarea, input, button {
-        color: var(--wf-text) !important;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-    }
-
-    /* リンク */
-    a, a:visited { color: var(--wf-link) !important; }
-
-    /* Streamlitの説明文っぽい薄文字を少し濃く */
-    small, .stCaption, [data-testid="stCaptionContainer"] * {
-        color: var(--wf-text-sub) !important;
-        opacity: 1 !important;
-    }
-
-    body { overflow-x: hidden; }
-
-    .block-container {
-        max-width: 980px;
-        padding-top: calc(env(safe-area-inset-top) + 4.6rem);
-        padding-bottom: 2rem;
-        padding-left: 1rem;
-        padding-right: 1rem;
-    }
-    @media (max-width: 640px) {
-        .block-container {
-            padding-top: calc(env(safe-area-inset-top) + 5.6rem);
-            padding-left: 0.7rem;
-            padding-right: 0.7rem;
-        }
-    }
-
-    .wf-title {
-        font-size: 1.7rem; font-weight: 900; letter-spacing: .2px;
-        background: linear-gradient(90deg, #42a5f5, #ab47bc, #66bb6a);
-        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-        display: flex; gap: .4rem; align-items: center; margin-bottom: .15rem;
-    }
-    .wf-sub { font-size: .95rem; color: var(--wf-text-sub) !important; opacity: 1 !important; margin-bottom: .55rem; }
-
-    .wf-card {
-        background: rgba(255,255,255,0.90);
-        border: 1px solid rgba(0,0,0,0.08);
-        border-radius: 18px;
-        padding: 12px 14px;
-        box-shadow: 0 6px 18px rgba(0,0,0,0.05);
-        margin-top: .6rem;
-        color: var(--wf-text) !important;
-    }
-    .wf-section {
-        font-size: 1.05rem;
-        font-weight: 850;
-        margin-top: 1rem;
-        margin-bottom: .45rem;
-        display:flex;
-        align-items:center;
-        gap:.35rem;
-        color: var(--wf-text) !important;
-    }
-    .wf-badge {
-        display:inline-block;
-        padding: .18rem .55rem;
-        border-radius: 999px;
-        font-weight: 900;
-        border: 1px solid rgba(0,0,0,0.12);
-        background: rgba(255,255,255,0.75);
-        margin-right: .35rem;
-        color: var(--wf-text) !important;
-    }
-
-    .stButton>button {
-        border-radius: 14px !important;
-        padding: 0.58rem 0.82rem !important;
-        font-weight: 800 !important;
-        border: 1px solid rgba(0,0,0,0.10) !important;
-        box-shadow: 0 6px 16px rgba(0,0,0,0.05) !important;
-    }
-
-    /* ✅ metricの文字も濃く */
-    [data-testid="stMetricLabel"], [data-testid="stMetricValue"] {
-        color: var(--wf-text) !important;
-    }
-    </style>
-    """
-    st.markdown(css, unsafe_allow_html=True)
-
-
-def risk_card(label: str, color: str, emoji: str, total_score: int, base_score: int, daily_score: int):
-    bg = f"{color}22"
-    st.markdown(
-        f"""
-        <div class="wf-card" style="border-color:{color}66;background:{bg};">
-          <div style="font-size:1.1rem;font-weight:900;display:flex;gap:.45rem;align-items:center;color:#2f2f2f;">
-            <span style="font-size:1.25rem;">{emoji}</span>
-            <span>きょうの体調リスク：{label}</span>
-          </div>
-          <div style="opacity:1;margin-top:.25rem;color:#2f2f2f;">
-            スコア合計 <b>{total_score}</b>（ベース {base_score} ＋ 今日 {daily_score}）
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def forecast_label_style(label: str) -> Tuple[str, str]:
-    if label == "低め":
-        return "🟢 低め", "#B7F0C1"
-    if label == "やや高め":
-        return "🟡 やや高め", "#FFF2B2"
-    return "🔴 高め", "#FFD1D9"
-
-
-def render_forecast_cards(forecast_days: List[Dict[str, Any]]):
-    st.markdown('<div class="wf-section">🗓️ 予報（カード一覧）</div>', unsafe_allow_html=True)
-    st.markdown("<div class='wf-card'>日付ごとの「崩れやすさ」をカードで表示します。開くと理由が見られます。</div>", unsafe_allow_html=True)
-
-    cols = st.columns(3)
-    for i, d in enumerate(forecast_days):
-        date_obj: dt.date = d["date"]
-        date_str = date_obj.strftime("%m/%d (%a)")
-        title, bg = forecast_label_style(d["label"])
-        col = cols[i % 3]
-        with col:
-            with st.expander(f"{date_str}  {title}  （スコア {d['score']}）", expanded=False):
-                st.markdown(
-                    f"<div class='wf-card' style='background:{bg};border-color:rgba(0,0,0,0.10)'>"
-                    f"<span class='wf-badge'>最低気圧</span>{fmt_opt(d.get('min_pressure'), '.1f')} hPa<br>"
-                    f"<span class='wf-badge'>気圧変化(3h)</span>{fmt_opt(d.get('max_drop_3h'), '+.1f')} hPa<br>"
-                    f"<span class='wf-badge'>気温</span>{fmt_opt(d.get('min_temp'), '.1f')}〜{fmt_opt(d.get('max_temp'), '.1f')} ℃<br>"
-                    f"<span class='wf-badge'>体感</span>{fmt_opt(d.get('min_feels'), '.1f')}〜{fmt_opt(d.get('max_feels'), '.1f')} ℃<br>"
-                    f"<span class='wf-badge'>湿度</span>{fmt_opt(d.get('min_rh'), '.0f')}〜{fmt_opt(d.get('max_rh'), '.0f')} %<br>"
-                    f"<span class='wf-badge'>雨（合計）</span>{fmt_opt(d.get('prec_sum'), '.1f')} mm<br>"
-                    f"<span class='wf-badge'>風（最大）</span>{fmt_opt(d.get('wind_max'), '.1f')} m/s"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
-                if d.get("reasons"):
-                    st.write("理由：")
-                    for r in d["reasons"]:
-                        st.write(f"- {r}")
-
+        return f"AIアドバイスの生成中にエラーが発生しました: {e}"
 
 # ==================================================
-# Profile tab UI
+# UI Components
 # ==================================================
-def profile_tab_ui(profile: Dict[str, Any]) -> Dict[str, Any]:
-    st.markdown('<div class="wf-section">🧑‍⚕️ プロフィール</div>', unsafe_allow_html=True)
-    st.markdown('<div class="wf-card">体調の「崩れやすさ」の土台に使います。任意の項目は空でOKです。</div>', unsafe_allow_html=True)
+def render_sidebar_profile(profile):
+    st.sidebar.markdown("### 👤 プロフィール設定")
+    with st.sidebar.expander("基本情報の編集", expanded=False):
+        profile["age"] = st.number_input("年齢", 0, 100, profile["age"])
+        profile["sex"] = st.selectbox("性別", ["未設定", "男性", "女性", "その他"], index=["未設定", "男性", "女性", "その他"].index(profile["sex"]))
+        profile["height_cm"] = st.number_input("身長(cm)", 0.0, 250.0, profile["height_cm"])
+        profile["weight_kg"] = st.number_input("体重(kg)", 0.0, 300.0, profile["weight_kg"])
+        
+        st.caption("持病・体質")
+        c = profile["chronic"]
+        c["migraine"] = st.checkbox("片頭痛", c["migraine"])
+        c["asthma"] = st.checkbox("喘息・気管支", c["asthma"])
+        c["hypertension"] = st.checkbox("高血圧", c["hypertension"])
+        c["anxiety_depression"] = st.checkbox("メンタル不調", c["anxiety_depression"])
+        
+        if st.button("プロフィールを保存"):
+            save_profile(profile)
+            st.success("保存しました")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        age = st.number_input("年齢", min_value=0, max_value=120, value=int(profile["age"]) if profile["age"] is not None else 40)
-        height_cm = st.number_input("身長（cm）", min_value=0.0, max_value=250.0,
-                                    value=float(profile["height_cm"]) if profile["height_cm"] is not None else 170.0, step=0.5)
-    with col2:
-        weight_kg = st.number_input("体重（kg）", min_value=0.0, max_value=300.0,
-                                    value=float(profile["weight_kg"]) if profile["weight_kg"] is not None else 60.0, step=0.5)
-        blood_type = st.text_input("血液型（任意）", value=profile.get("blood_type", ""))
+def render_sidebar_location():
+    st.sidebar.markdown("### 📍 場所設定")
+    city_name = st.sidebar.selectbox("エリアを選択", list(CITIES.keys()))
+    
+    lat, lon = CITIES[city_name]
+    
+    if city_name == "手動入力":
+        lat = st.sidebar.number_input("緯度", -90.0, 90.0, 35.69)
+        lon = st.sidebar.number_input("経度", -180.0, 180.0, 139.69)
+    
+    return lat, lon, city_name
 
-    sex = st.selectbox("性別（任意）", ["未設定", "男性", "女性", "その他"],
-                       index=["未設定", "男性", "女性", "その他"].index(profile.get("sex", "未設定")))
-
-    st.markdown("##### 慢性的なもの（当てはまる場合だけ）")
-    ch = profile["chronic"]
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        ch["migraine"] = st.checkbox("片頭痛", value=ch.get("migraine", False))
-        ch["tension_headache"] = st.checkbox("緊張型頭痛", value=ch.get("tension_headache", False))
-        ch["anxiety_depression"] = st.checkbox("不安・うつなど", value=ch.get("anxiety_depression", False))
-    with c2:
-        ch["asthma"] = st.checkbox("喘息", value=ch.get("asthma", False))
-        ch["copd"] = st.checkbox("COPD / 肺気腫", value=ch.get("copd", False))
-    with c3:
-        ch["hypertension"] = st.checkbox("高血圧", value=ch.get("hypertension", False))
-        ch["diabetes"] = st.checkbox("糖尿病", value=ch.get("diabetes", False))
-        ch["cvd"] = st.checkbox("心臓の病気", value=ch.get("cvd", False))
-
-    st.markdown("##### アレルギー")
-    al = profile["allergy"]
-    al["nsaids"] = st.checkbox("痛み止め（NSAIDs）で強い副反応/アレルギーが出たことがある", value=al.get("nsaids", False))
-    al["antibiotics"] = st.checkbox("抗生物質でアレルギーが出たことがある", value=al.get("antibiotics", False))
-    al["food"] = st.text_input("食べ物（あれば）", value=al.get("food", ""))
-    al["others"] = st.text_input("その他（あれば）", value=al.get("others", ""))
-
-    if st.button("💾 保存する", use_container_width=True):
-        profile["age"] = int(age)
-        profile["sex"] = sex
-        profile["height_cm"] = float(height_cm) if height_cm > 0 else None
-        profile["weight_kg"] = float(weight_kg) if weight_kg > 0 else None
-        profile["blood_type"] = blood_type
-        profile["chronic"] = ch
-        profile["allergy"] = al
-        save_profile(profile)
-        st.success("保存しました！次回以降もこの情報を使います。")
-
-    bmi = calc_bmi(profile.get("height_cm"), profile.get("weight_kg"))
-    if bmi is not None:
-        st.info(f"BMI（目安）: {bmi:.1f}")
-
-    base_score, base_reasons = calc_profile_base_risk(profile)
-    st.markdown('<div class="wf-section">🧩 ベースの崩れやすさ</div>', unsafe_allow_html=True)
-    st.markdown(f"<div class='wf-card'>ベーススコア：<b>{base_score}</b>（0〜3）</div>", unsafe_allow_html=True)
-    if base_reasons:
-        for r in base_reasons:
-            st.write(f"- {r}")
-    else:
-        st.write("今の登録内容では、目立つベース要因は少なめです。")
-
-    return profile
-
-
-# ==================================================
-# Main
-# ==================================================
-def main():
-    st.set_page_config(page_title=APP_TITLE, page_icon="🩺", layout="wide")
-    inject_css()
-
-    if "profile" not in st.session_state:
-        st.session_state.profile = load_profile()
-    if "active_tab" not in st.session_state:
-        st.session_state.active_tab = "today"
-    if "wf_result" not in st.session_state:
-        st.session_state.wf_result = None
-
-    profile = st.session_state.profile
-
-    st.markdown(f'<div class="wf-title">🩺 {APP_TITLE}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="wf-sub">気圧＋気温＋湿度＋雨＋風で「崩れやすさ」を見える化します。</div>', unsafe_allow_html=True)
-    st.markdown("<div class='wf-card'>※このアプリは体調管理の目安です。強い症状があるときはスコアに関係なく医療機関の受診を検討してください。</div>", unsafe_allow_html=True)
-
-    t1, t2 = st.columns(2)
-    with t1:
-        if st.button("🌈 きょうのようす", use_container_width=True):
-            st.session_state.active_tab = "today"
-    with t2:
-        if st.button("🧑‍⚕️ プロフィール", use_container_width=True):
-            st.session_state.active_tab = "profile"
-
-    if st.session_state.active_tab == "profile":
-        st.session_state.profile = profile_tab_ui(profile)
+def render_dashboard(profile, lat, lon):
+    # 1. Fetch Data
+    with st.spinner("気象データを分析中..."):
+        df, err = fetch_weather_data(lat, lon)
+    
+    if err:
+        st.error(f"天気データの取得に失敗しました: {err}")
         return
 
-    st.markdown('<div class="wf-section">🌤️ きょうの入力</div>', unsafe_allow_html=True)
+    # 2. Daily Inputs
+    st.markdown('<div class="wf-section-title">📝 今日のコンディション</div>', unsafe_allow_html=True)
+    with st.container():
+        # Using columns for input feels cleaner
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            sleep = st.number_input("睡眠時間 (h)", 0.0, 15.0, 6.5, 0.5)
+        with c2:
+            rhr_diff = st.number_input("安静時心拍のズレ", -20, 20, 0, help="普段より高いと+、低いと-")
+        with c3:
+            steps = st.number_input("昨日の歩数", 0, 50000, 6000, 1000)
+        
+        c4, c5 = st.columns([1, 2])
+        with c4:
+            alcohol = st.checkbox("昨日飲酒した")
+        with c5:
+            note = st.text_input("気になる症状・メモ", placeholder="例: 頭が重い、少し風邪気味...")
 
-    with st.form("wf_form", clear_on_submit=False):
-        st.markdown("<div class='wf-card'>📍 場所（天気を取る地点です）</div>", unsafe_allow_html=True)
-        colA, colB, colC = st.columns([1.2, 1.2, 1])
-        with colA:
-            latitude = st.number_input("緯度", -90.0, 90.0, DEFAULT_LAT, 0.01, key="lat")
-        with colB:
-            longitude = st.number_input("経度", -180.0, 180.0, DEFAULT_LON, 0.01, key="lon")
-        with colC:
-            use_auto_weather = st.checkbox("APIで自動取得", value=True, key="auto_weather")
+    # 3. Calculate Risks
+    # Profile Risk
+    base_score, base_reasons = calc_profile_base_risk(profile)
+    # Lifestyle Risk
+    life_score, life_reasons = calc_daily_lifestyle_risk(sleep, alcohol, steps, rhr_diff)
+    # Weather Risk
+    w_score, w_reasons, w_snapshot = analyze_weather_risk(df)
+    
+    total_score = base_score + life_score + w_score
+    risk_label, risk_color, risk_emoji = get_risk_level_info(total_score)
+    all_reasons = base_reasons + life_reasons + w_reasons
 
-        st.markdown("<div class='wf-card'>🧸 きょうの体調メモ（だいたいでOK）</div>", unsafe_allow_html=True)
-        col1, col2 = st.columns(2)
-        with col1:
-            sleep_hours = st.number_input("昨夜の睡眠時間（時間）", 0.0, 15.0, 6.0, 0.5, key="sleep")
-            alcohol = st.checkbox("きのうお酒を飲んだ", value=False, key="alcohol")
-            steps_raw = st.number_input("きのうの歩数（0なら不明）", 0, 50000, 6000, 500, key="steps")
-            steps = steps_raw if steps_raw > 0 else None
-        with col2:
-            manual_pressure_drop = st.number_input("直近3時間の気圧変化[hPa]（API不調のとき）", -20.0, 20.0, 0.0, 0.1, key="pdrop")
-            resting_hr_diff = st.number_input("安静時心拍（ふだんとの差）[bpm]", -30.0, 30.0, 0.0, 1.0, key="rhr")
+    st.markdown("---")
 
-        user_note = st.text_area("気になる症状・予定（任意）", placeholder="例）片側の頭がズキズキ／鼻づまり／今日は冷えた… など", key="note")
-
-        st.markdown("<div class='wf-card'>🗓️ 予報の表示日数</div>", unsafe_allow_html=True)
-        days_ahead = st.slider("何日先まで表示する？", min_value=3, max_value=14, value=7, step=1, key="days")
-
-        run_clicked = st.form_submit_button("✨ きょうのリスク＋予報を見る", use_container_width=True)
-
-    if st.button("🧹 結果をクリア", use_container_width=True):
-        st.session_state.wf_result = None
-
-    if run_clicked:
-        pressure_drop_3h = manual_pressure_drop
-        latest_pressure = None
-        bundle = None
-
-        if use_auto_weather:
-            with st.spinner("天気データを取得しています…"):
-                p_drop, latest_p, msg, bundle = fetch_weather_from_open_meteo(latitude, longitude)
-            api_msg = msg
-            if p_drop is not None:
-                pressure_drop_3h = p_drop
-            latest_pressure = latest_p
-        else:
-            api_msg = "API自動取得はOFFです（手動の気圧変化を使用）。"
-
-        base_score, base_reasons = calc_profile_base_risk(profile)
-        daily_score, daily_reasons = calc_daily_risk(
-            sleep_hours=sleep_hours,
-            alcohol=alcohol,
-            pressure_drop_3h=pressure_drop_3h,
-            resting_hr_diff=resting_hr_diff,
-            steps=steps,
-        )
-
-        weather_snapshot = {}
-        if bundle and bundle.get("hourly"):
-            ws, wr, snap = add_weather_risk_from_latest(bundle["hourly"])
-            daily_score += ws
-            daily_reasons.extend(wr)
-            weather_snapshot = snap
-
-        total_score = base_score + daily_score
-        label, color, emoji = classify_total_risk(total_score)
-
-        forecast_days: List[Dict[str, Any]] = []
-        if bundle and bundle.get("hourly"):
-            forecast_days = build_daily_forecast_from_hourly(bundle["hourly"], days_ahead=days_ahead)
-
-        gemini_text = None
-        if client is not None:
-            with st.spinner("AIのやさしいアドバイスを作成中…"):
-                profile_summary = summarize_profile_for_gemini(profile)
-                gemini_text = call_gemini_for_advice(
-                    profile_summary=profile_summary,
-                    risk_label=label,
-                    total_score=total_score,
-                    base_score=base_score,
-                    daily_score=daily_score,
-                    base_reasons=base_reasons,
-                    daily_reasons=daily_reasons,
-                    user_note=user_note,
+    # 4. Main Score Display
+    c_main, c_weather = st.columns([1.2, 1])
+    
+    with c_main:
+        st.markdown(f"""
+        <div class="wf-card" style="border-left: 6px solid {risk_color};">
+            <div style="font-size:0.9rem; color:#666;">今日のウェルネス・スコア</div>
+            <div style="font-size:2.4rem; font-weight:900; color:{risk_color}; display:flex; align-items:center; gap:10px;">
+                {risk_emoji} {risk_label} <span style="font-size:1.2rem; color:#888;">({total_score} pts)</span>
+            </div>
+            <div style="margin-top:0.5rem; font-size:0.95rem;">
+                <b>要注意ポイント:</b><br>
+                {'<br>'.join([f"・{r}" for r in all_reasons]) if all_reasons else "・特になし。素晴らしいコンディションです！"}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # AI Advice
+        if st.button("🤖 AIアドバイスを生成", type="primary", use_container_width=True):
+            with st.spinner("AIがカルテを作成中..."):
+                advice = generate_gemini_advice(
+                    get_profile_summary_text(profile), 
+                    risk_label, total_score, all_reasons, note
                 )
+                st.info(advice)
 
-        st.session_state.wf_result = {
-            "api_msg": api_msg,
-            "latest_pressure": latest_pressure,
-            "pressure_drop_3h": pressure_drop_3h,
-            "base_score": base_score,
-            "base_reasons": base_reasons,
-            "daily_score": daily_score,
-            "daily_reasons": daily_reasons,
-            "total_score": total_score,
-            "label": label,
-            "color": color,
-            "emoji": emoji,
-            "weather_snapshot": weather_snapshot,
-            "forecast_days": forecast_days,
-            "gemini_text": gemini_text,
-        }
+    with c_weather:
+        st.markdown('<div class="wf-section-title" style="margin-top:0;">🌤 現在の気象状況</div>', unsafe_allow_html=True)
+        w_cols = st.columns(2)
+        w_cols[0].metric("気圧", f"{w_snapshot['pressure']:.0f} hPa", f"{w_snapshot['pressure_drop']:+.1f} (3h)")
+        w_cols[1].metric("気温", f"{w_snapshot['temp']:.1f} ℃")
+        w_cols[0].metric("湿度", f"{w_snapshot['humidity']:.0f} %")
+        w_cols[1].metric("風速", f"{w_snapshot['wind']:.1f} m/s")
+        
+        if w_snapshot['pressure_drop'] <= -2.0:
+            st.warning("⚠️ 気圧が低下傾向です。頭痛等に注意してください。")
 
-    # ==================================================
-    # Results
-    # ==================================================
-    res = st.session_state.wf_result
-    if res:
-        st.info(res["api_msg"])
+    # 5. Charts
+    st.markdown('<div class="wf-section-title">📉 今後の気圧・気温予報</div>', unsafe_allow_html=True)
+    create_weather_chart(df)
+    
+    # 6. Weekly Table
+    with st.expander("週間予報の詳細データを見る"):
+        # Create a simple summary table
+        df['date'] = df['time'].dt.date
+        daily = df.groupby('date').agg({
+            'temperature_2m': ['min', 'max'],
+            'pressure_msl': 'min',
+            'precipitation': 'sum'
+        }).reset_index()
+        daily.columns = ['日付', '最低気温', '最高気温', '最低気圧', '降水量']
+        st.dataframe(daily, hide_index=True, use_container_width=True)
 
-        st.markdown('<div class="wf-section">🧡 きょうの結果</div>', unsafe_allow_html=True)
-        risk_card(res["label"], res["color"], res["emoji"], res["total_score"], res["base_score"], res["daily_score"])
 
-        st.markdown("<div class='wf-card'>📌 いまの天気（参考）</div>", unsafe_allow_html=True)
-        cW1, cW2, cW3, cW4, cW5 = st.columns(5)
-        with cW1:
-            lp = res["latest_pressure"]
-            st.metric("気圧(hPa)", f"{lp:.1f}" if lp is not None else "—")
-        with cW2:
-            t = res["weather_snapshot"].get("temperature_2m")
-            st.metric("気温(℃)", f"{t:.1f}" if t is not None else "—")
-        with cW3:
-            a = res["weather_snapshot"].get("apparent_temperature")
-            st.metric("体感(℃)", f"{a:.1f}" if a is not None else "—")
-        with cW4:
-            h = res["weather_snapshot"].get("relative_humidity_2m")
-            st.metric("湿度(%)", f"{h:.0f}" if h is not None else "—")
-        with cW5:
-            w = res["weather_snapshot"].get("wind_speed_10m")
-            st.metric("風速(m/s)", f"{w:.1f}" if w is not None else "—")
+# ==================================================
+# Main App
+# ==================================================
+def main():
+    st.set_page_config(page_title=APP_TITLE, page_icon="🌿", layout="wide")
+    inject_css()
+    
+    # Session State Init
+    if "profile" not in st.session_state:
+        st.session_state.profile = load_profile()
+    
+    # Header
+    st.markdown(f'<h1 style="margin-bottom:0;">🌿 {APP_TITLE}</h1>', unsafe_allow_html=True)
+    st.caption("気象データとあなたの体調プロフィールから、今日のリスクを予測します。")
 
-        st.write(f"直近3時間の気圧変化（判定に使用）: {res['pressure_drop_3h']:+.1f} hPa")
+    # Sidebar
+    lat, lon, city_name = render_sidebar_location()
+    st.sidebar.markdown("---")
+    render_sidebar_profile(st.session_state.profile)
+    
+    if lat is None:
+        st.warning("👈 サイドバーから場所を設定してください。")
+        return
 
-        st.markdown('<div class="wf-section">🧩 理由（ざっくり）</div>', unsafe_allow_html=True)
-        st.markdown("<div class='wf-card'>", unsafe_allow_html=True)
-        st.write("ベース（プロフィール）:")
-        if res["base_reasons"]:
-            for r in res["base_reasons"]:
-                st.write(f"- {r}")
-        else:
-            st.write("- 目立つベース要因は少なめです。")
-
-        st.write("\nきょう（睡眠・気圧・天気など）:")
-        if res["daily_reasons"]:
-            for r in res["daily_reasons"]:
-                st.write(f"- {r}")
-        else:
-            st.write("- 目立つ追加要因は少なめです。")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown('<div class="wf-section">🤖 AIのやさしいアドバイス</div>', unsafe_allow_html=True)
-        if client is None:
-            st.markdown("<div class='wf-card'>Geminiは未設定です（環境変数 GEMINI_API_KEY を設定すると有効になります）。</div>", unsafe_allow_html=True)
-        else:
-            st.markdown(f"<div class='wf-card'>{safe_html_text(res.get('gemini_text'))}</div>", unsafe_allow_html=True)
-
-        if res.get("forecast_days"):
-            render_forecast_cards(res["forecast_days"])
-        else:
-            st.markdown("<div class='wf-card'>予報を計算できませんでした（API自動取得OFFの場合もここになります）。</div>", unsafe_allow_html=True)
-
-        st.markdown(
-            "<div class='wf-card'>"
-            "🆘 強い頭痛、胸の痛み、息苦しさ、ろれつが回らない、片側の手足が動きにくい、意識がもうろう… "
-            "などがある場合は、スコアに関係なく早めに医療機関の受診を検討してください。"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-
+    # Dashboard
+    st.markdown(f"### 📍 {city_name} の予報")
+    render_dashboard(st.session_state.profile, lat, lon)
 
 if __name__ == "__main__":
     main()
