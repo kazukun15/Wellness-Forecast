@@ -49,7 +49,7 @@ CITIES = {
 }
 
 # ==================================================
-# ロジック（変更なし）
+# ロジック
 # ==================================================
 def default_profile() -> Dict[str, Any]:
     return {
@@ -181,7 +181,7 @@ def inject_custom_css():
             display: flex;
             overflow-x: auto;
             gap: 15px;
-            padding: 10px 5px 20px 5px; /* 下部にスクロールバー用の余白 */
+            padding: 10px 5px 20px 5px;
             scrollbar-width: thin;
         }
         .forecast-item {
@@ -306,7 +306,6 @@ def main():
                 city_choice = st.selectbox("地域を選択", list(CITIES.keys()))
                 default_lat, default_lon = CITIES[city_choice]
             with ec2:
-                # 手動入力の場合のみ有効化するロジックも可能だが、簡易化のため常に表示
                 lat = st.number_input("緯度", -90.0, 90.0, default_lat if default_lat else 34.25, label_visibility="collapsed")
                 lon = st.number_input("経度", -180.0, 180.0, default_lon if default_lon else 133.20, label_visibility="collapsed")
                 st.caption(f"Lat: {lat}, Lon: {lon}")
@@ -388,7 +387,6 @@ def main():
                 
                 chart_df = df.head(48).copy()
                 
-                # チャートの改善：エリアチャート + ポイント
                 base = alt.Chart(chart_df).encode(x=alt.X('time:T', title=None, axis=alt.Axis(format='%H:%M')))
                 
                 area = base.mark_area(
@@ -404,7 +402,6 @@ def main():
                     tooltip=['time', 'pressure_msl', 'temperature_2m']
                 )
                 
-                # 気圧低下ポイントを赤く表示するためのロジック（簡易）
                 points = base.mark_circle(size=60, color='#1976D2').encode(
                     y='pressure_msl:Q',
                     tooltip=['time', 'pressure_msl']
@@ -416,25 +413,27 @@ def main():
             # --- 週間予報（カレンダー）---
             st.subheader("🗓️ 週間リスクカレンダー")
             
-            # 横スクロール可能なHTML構造を構築
+            # HTML構築
+            # 注意: ここでf-string内のインデントをなくし、Markdownのコードブロック誤認を防止しています
             forecast_html = '<div class="forecast-scroll">'
             
             week_days = ["月", "火", "水", "木", "金", "土", "日"]
             
-            for f in daily_forecasts[:10]: # 10日分表示
+            for f in daily_forecasts[:10]:
                 d_score = f['score'] + base_score
                 d_design = get_risk_design(d_score)
                 wd = week_days[f['date'].weekday()]
                 date_str = f['date'].strftime('%m/%d')
                 
+                # HTMLを一行、またはインデントなしで結合
                 forecast_html += f"""
-                <div class="forecast-item">
-                    <div class="f-date">{date_str} ({wd})</div>
-                    <div class="f-icon">{d_design['icon']}</div>
-                    <div class="f-badge" style="background:{d_design['color']};">Lv.{d_score}</div>
-                    <div class="f-temp">🌡️ {f['temp_range'][0]:.0f}-{f['temp_range'][1]:.0f}℃</div>
-                </div>
-                """
+<div class="forecast-item">
+<div class="f-date">{date_str} ({wd})</div>
+<div class="f-icon">{d_design['icon']}</div>
+<div class="f-badge" style="background:{d_design['color']};">Lv.{d_score}</div>
+<div class="f-temp">🌡️ {f['temp_range'][0]:.0f}-{f['temp_range'][1]:.0f}℃</div>
+</div>"""
+            
             forecast_html += '</div>'
             
             st.markdown(forecast_html, unsafe_allow_html=True)
